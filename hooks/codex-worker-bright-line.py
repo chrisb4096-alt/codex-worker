@@ -21,7 +21,12 @@ import json, re, sys, time, os
 
 # Keep in sync with RUNNER_CALL in executable_codex-worker-stop-gate.py —
 # PreToolUse must never allow a form the stop-gate refuses to count as proof.
-RUNNER_CALL = re.compile(r'(?:^|[\s;&|(])(?:~|/|\$HOME)\S*/codex-run\.sh(?:\s|$)')
+# The runner path MUST include the `.claude/agents/bin/` prefix: a bare
+# `/codex-run.sh` tail let a forwarder `cat > /tmp/codex-run.sh` (an allowed
+# heredoc write) then exec `/tmp/codex-run.sh` (both gate-approved) — a
+# write-then-exec bypass (v3.5 high review). A single heredoc segment cannot
+# build the nested `.claude/agents/bin/` dir, so requiring it closes the hole.
+RUNNER_CALL = re.compile(r'(?:^|[\s;&|(])(?:~|\$HOME|/\S+?)/\.claude/agents/bin/codex-run\.sh(?:\s|$)')
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
 SEG_OK = [re.compile(p) for p in (
     r'^$',
@@ -31,16 +36,18 @@ SEG_OK = [re.compile(p) for p in (
     r"^read\s+-r\s+-d\s+''\s+\w+\s*(<<-?\s*'?\w+'?)?$",         # task staging
     # pipe feed, no redirects. printf MUST carry a single-quoted format
     # literal — a bare `printf "$TASK"` treats task bytes as the format
-    # string and corrupts %-sequences (caught in v3.5 review). echo may be
-    # var-only (`echo "$TASK"` — 2026-07-08 false-deny class).
-    r'^printf(\s+-[a-zA-Z]+)*\s+\'[^\']*\'(\s+"\$\{?\w+\}?")*$',
-    r'^echo(\s+-[a-zA-Z]+)*(\s+\'[^\']*\')?(\s+"\$\{?\w+\}?")*$',
+    # string and corrupts %-sequences (caught in v3.5 review). Flags may
+    # include the `--` end-of-options separator. echo may be var-only
+    # (`echo "$TASK"` — 2026-07-08 false-deny class).
+    r'^printf(\s+(--|-[a-zA-Z]+))*\s+\'[^\']*\'(\s+"\$\{?\w+\}?")*$',
+    r'^echo(\s+(--|-[a-zA-Z]+))*(\s+\'[^\']*\')?(\s+"\$\{?\w+\}?")*$',
     # heredoc write to a tmpfile — marker before OR after the redirect
     # (`cat <<'EOF' > "$F"` was false-denied 2026-07-07, costing 2 turns).
-    # The literal target is a SINGLE /tmp segment of a safe charset — NOT
-    # `\S+`, which matched `/tmp/$(...)` command substitution and `/tmp/../`
-    # traversal from inside an allowed segment (v3.5 adversarial review gb-1).
-    r'^(cat|tee)\s*(<<-?\s*\'?\w+\'?)?\s*>{1,2}\s*("?\$\{?\w+\}?"?|/tmp/[A-Za-z0-9._-]+)\s*(<<-?\s*\'?\w+\'?)?$',
+    # The literal /tmp target allows nested dirs (this session's scratch is
+    # /tmp/claude-1000/.../scratchpad) but the charset excludes `$(){}` (no
+    # command substitution) and the `(?!\S*\.\.)` lookahead forbids `..`
+    # traversal — the pair that `/tmp/\S+` let through (v3.5 review gb-1).
+    r'^(cat|tee)\s*(<<-?\s*\'?\w+\'?)?\s*>{1,2}\s*("?\$\{?\w+\}?"?|/tmp/(?!\S*\.\.)[A-Za-z0-9._/-]+)\s*(<<-?\s*\'?\w+\'?)?$',
 )]
 GATE_LOG = os.path.expanduser('~/.claude/hooks/codex-gate.log')
 USAGE_LOG = os.path.expanduser('~/.codex-worker/usage.log')

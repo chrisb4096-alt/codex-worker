@@ -32,11 +32,17 @@ SESSION_FOOTER = re.compile(r'^\[codex-session: (?!missing)(\S+)\]', re.M)
 # stripped finals twice, content stranded in the archive). The
 # [codex-final-file:] envelope IS content — deliberately not in this set.
 FOOTER_LINE = re.compile(r'^\s*\[codex-(session|usage|files-written):')
+# ZWSP, ZWNJ, ZWJ, word-joiner, BOM — explicit codepoints, never literal
+# invisible bytes in source, so an editor/chezmoi transform that strips
+# zero-width chars cannot silently reopen the gb-2 hole (v3.5 high review).
+ZERO_WIDTH = {0x200b, 0x200c, 0x200d, 0x2060, 0xfeff}
 # Path-form invocation of the runner (also matches the printed --poll continuation);
 # an `echo codex-run.sh` or a mention inside other text does not count.
 # Keep in sync with RUNNER_CALL in executable_codex-worker-bright-line.py —
-# the PreToolUse gate must never allow a form this gate refuses to count.
-RUNNER_CALL = re.compile(r'(?:^|[\s;&|(])(?:~|/|\$HOME)\S*/codex-run\.sh(?:\s|$)', re.M)
+# the PreToolUse gate must never allow a form this gate refuses to count. The
+# `.claude/agents/bin/` prefix is required so a written /tmp/codex-run.sh
+# neither passes the bright-line nor counts as proof here (v3.5 high review).
+RUNNER_CALL = re.compile(r'(?:^|[\s;&|(])(?:~|\$HOME|/\S+?)/\.claude/agents/bin/codex-run\.sh(?:\s|$)', re.M)
 LOG = os.path.expanduser('~/.claude/hooks/codex-gate.log')
 USAGE_LOG = os.path.expanduser('~/.codex-worker/usage.log')
 
@@ -123,7 +129,7 @@ def main():
     # and BOM chars don't count (v3.5 review gb-2: U+200B survived .strip()
     # and masked a stripped relay as real content).
     def visible(l):
-        return bool(re.sub(r'[\s​‌‍⁠﻿]', '', l))
+        return bool(l.translate(dict.fromkeys(ZERO_WIDTH)).strip())
     has_content = any(visible(l) and not FOOTER_LINE.match(l)
                       for l in last_assistant.splitlines())
     if forwarded and (structured or (sess and has_content)):

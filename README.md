@@ -15,7 +15,7 @@ Claude Code's `Agent` tool and `Workflow` tool can spawn subagents of a custom t
 - `hooks/codex-worker-start-context.py` — SubagentStart injector: refreshes the contract in every leg's context before its first turn
 - `hooks/workflow-args-gate.py` — PreToolUse gate on the Workflow tool: catches double-encoded args and unguarded scripts at dispatch
 - `workflows/` — `codex-review`, `codex-implement-verify`, `codex-research` templates
-- `tests/test_gates.py` — 42-case unit matrix for the hooks (stdlib only)
+- `tests/test_gates.py` — 51-case unit matrix for the hooks (stdlib only)
 
 ## How it works
 
@@ -146,7 +146,7 @@ Read `agents/codex-worker.md` for the contract, then `agents/bin/codex-run.sh` �
 python3 tests/test_gates.py
 ```
 
-42 cases covering all four hooks as subprocesses with an isolated `$HOME`, exercising the real stdin/stdout hook contract — including regression cases for each production incident above.
+51 cases covering all four hooks as subprocesses with an isolated `$HOME`, exercising the real stdin/stdout hook contract — including regression cases for each production incident above.
 
 ## License
 

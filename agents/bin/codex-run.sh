@@ -270,7 +270,10 @@ emit_block() { # $1=status $2=scratch $3=keep (yes|no)
   fi
   RELAY=inline FINAL_FILE="" BYTES=0 ARCHIVE="" KEEP_SCRATCH=0 FILES_N=""
   [ "$status" = ok ] && prepare_final "$S"
-  [ "$status" = ok ] && [ "$(sed -n 2p "$S/meta")" = workspace-write ] && FILES_N=$(files_written "$S" | grep -c .)
+  # FILES_N feeds the footer emitter + usage.log; only footer mode uses it, and
+  # envelope mode runs its own files_written for the file LIST — computing it
+  # here for envelope mode too would traverse the workspace twice (v3.5 review).
+  [ "$FOOTER" = 1 ] && [ "$status" = ok ] && [ "$(sed -n 2p "$S/meta")" = workspace-write ] && FILES_N=$(files_written "$S" | grep -c .)
   [ "$KEEP_SCRATCH" = 1 ] && keep=yes
   [ "$status" = running ] || { mkdir -p "$WORKER_HOME" && echo "$(date -Is) $status session=$SESSION $USAGE${FILES_N:+ files=$FILES_N} cwd=$(sed -n 1p "$S/meta" 2>/dev/null)${ARCHIVE:+ file=$ARCHIVE}" >> "$WORKER_HOME/usage.log"; } 2>/dev/null
   if [ "$FOOTER" = 1 ]; then emit_footer "$status" "$S"; else emit_envelope "$status" "$S" "$keep"; fi

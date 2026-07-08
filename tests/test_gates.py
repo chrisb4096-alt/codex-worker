@@ -144,6 +144,27 @@ class TestBrightLine(GateTest):
     def test_legit_tmp_literal_still_allowed(self):
         self.assertIsNone(self.call("cat > /tmp/schema.abc123 <<'EOF'\n{}\nEOF"))
 
+    def test_nested_tmp_path_allowed(self):
+        # v3.5 high review: the gb-1 charset narrowing dropped `/`, false-denying
+        # nested scratch dirs (this session's is /tmp/claude-1000/.../scratchpad).
+        self.assertIsNone(self.call("cat > /tmp/claude-1000/x/schema.json <<'EOF'\n{}\nEOF"))
+
+    def test_written_runner_not_executable(self):
+        # v3.5 high review: write-then-exec bypass. Writing /tmp/codex-run.sh is
+        # inert (allowed), but EXECUTING it must be denied — RUNNER_CALL requires
+        # the .claude/agents/bin/ prefix, so a /tmp copy is not the runner.
+        self.assertTrue(denied(self.call('/tmp/codex-run.sh')))
+        self.assertTrue(denied(self.call('/tmp/x/codex-run.sh --footer')))
+
+    def test_abs_runner_path_allowed(self):
+        self.assertIsNone(self.call(
+            "printf '%s' \"$TASK\" | /home/user/.claude/agents/bin/codex-run.sh --footer"))
+
+    def test_printf_dashdash_allowed(self):
+        # v3.5 high review: the `--` end-of-options separator is a safe idiom.
+        self.assertIsNone(self.call(
+            "printf -- '%s' \"$TASK\" | ~/.claude/agents/bin/codex-run.sh --footer"))
+
     def test_recover_call_allowed(self):
         self.assertIsNone(self.call('~/.claude/agents/bin/codex-run.sh --footer --recover 019f-abc'))
 
@@ -302,6 +323,12 @@ class TestStartContext(GateTest):
 
     def test_other_agents_ignored(self):
         self.assertIsNone(self.call('general-purpose'))
+
+    def test_absent_agent_type_still_injects(self):
+        # v3.5 high review: the settings.json `codex-worker` matcher already
+        # scoped this hook, so an absent agent_type must NOT silently no-op.
+        res = run(START, {'agent_id': 't', 'hook_event_name': 'SubagentStart'}, self.home)
+        self.assertIn('codex-run.sh', (res or {}).get('hookSpecificOutput', {}).get('additionalContext', ''))
 
     def test_garbage_stdin_fails_open(self):
         p = subprocess.run([sys.executable, START], input='not json', capture_output=True,

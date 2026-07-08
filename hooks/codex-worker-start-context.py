@@ -13,6 +13,10 @@ scopes it; the agent_type check below is defense in depth. Fail-open.
 import json
 import sys
 
+# Canonical contract is agents/codex-worker.md; this is a compact first-turn
+# echo of it. Keep the forwarding flow (staging idiom, runner flags, recovery)
+# in sync with that file, the bright-line REINSTRUCT, and the stop-gate block
+# reasons when any of them change (v3.5 high review: four hand-kept copies).
 REMINDER = (
     'codex-worker contract reminder (hooks enforce this): you are a FORWARDER, not a solver. '
     'Parse the directive lines, then run ONLY: `pwd` (when CWD is self/absent); `mktemp` + a heredoc '
@@ -31,7 +35,13 @@ def main():
         j = json.load(sys.stdin)
     except Exception:
         return
-    if j.get('agent_type') != 'codex-worker':
+    # Bail only if agent_type is present AND wrong — an absent field means we
+    # trust the settings.json `codex-worker` matcher that already scoped this
+    # hook (mirrors the stop-gate's None-fallback; SubagentStart agent_type is
+    # documented but not verified live, and a silent no-op would defeat the
+    # whole defense-in-depth reminder — v3.5 high review).
+    agent_type = j.get('agent_type')
+    if agent_type is not None and agent_type != 'codex-worker':
         return
     print(json.dumps({'hookSpecificOutput': {
         'hookEventName': 'SubagentStart',
