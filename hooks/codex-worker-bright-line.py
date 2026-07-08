@@ -29,8 +29,18 @@ SEG_OK = [re.compile(p) for p in (
     r'^[A-Za-z_]\w*=\$\(\s*mktemp(\s[^()]*)?\s*\)$',            # SCHEMA_FILE=$(mktemp)
     r'^mktemp(\s\S+)*$',
     r"^read\s+-r\s+-d\s+''\s+\w+\s*(<<-?\s*'?\w+'?)?$",         # task staging
-    r'^(printf|echo)\s+\'[^\']*\'(\s+"\$\{?\w+\}?")*$',         # pipe feed, no redirects
-    r'^(cat|tee)\s*>{1,2}\s*("?\$\{?\w+\}?"?|/tmp/\S+)\s*(<<-?\s*\'?\w+\'?)?$',
+    # pipe feed, no redirects. printf MUST carry a single-quoted format
+    # literal — a bare `printf "$TASK"` treats task bytes as the format
+    # string and corrupts %-sequences (caught in v3.5 review). echo may be
+    # var-only (`echo "$TASK"` — 2026-07-08 false-deny class).
+    r'^printf(\s+-[a-zA-Z]+)*\s+\'[^\']*\'(\s+"\$\{?\w+\}?")*$',
+    r'^echo(\s+-[a-zA-Z]+)*(\s+\'[^\']*\')?(\s+"\$\{?\w+\}?")*$',
+    # heredoc write to a tmpfile — marker before OR after the redirect
+    # (`cat <<'EOF' > "$F"` was false-denied 2026-07-07, costing 2 turns).
+    # The literal target is a SINGLE /tmp segment of a safe charset — NOT
+    # `\S+`, which matched `/tmp/$(...)` command substitution and `/tmp/../`
+    # traversal from inside an allowed segment (v3.5 adversarial review gb-1).
+    r'^(cat|tee)\s*(<<-?\s*\'?\w+\'?)?\s*>{1,2}\s*("?\$\{?\w+\}?"?|/tmp/[A-Za-z0-9._-]+)\s*(<<-?\s*\'?\w+\'?)?$',
 )]
 GATE_LOG = os.path.expanduser('~/.claude/hooks/codex-gate.log')
 USAGE_LOG = os.path.expanduser('~/.codex-worker/usage.log')

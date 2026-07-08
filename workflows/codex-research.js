@@ -36,10 +36,27 @@ const prose = (r) => {
   if (!f && !text) return null   // footers-with-empty-content misfire = failed leg
   return { text, file: f ? f[1] : '~/.codex-worker/results/' + s + '.txt', session: s }
 }
+// Spend caps (ops-readiness 2026-07-08): hard per-run ceilings so a runaway
+// fan-out pauses with a receipt instead of spending silently. Override per run
+// via args.max_agents / args.max_codex_tokens. Complements the harness
+// `budget` global, which meters only Claude-side output tokens.
+const CAPS = { agents: +args.max_agents || 16, codex_tokens: +args.max_codex_tokens || 5_000_000 }
+let agentCalls = 0, capPause = null
+const dispatch = async (p, opts) => {
+  const spent = usedTokens.input + usedTokens.output
+  const cap = agentCalls >= CAPS.agents ? 'max-agents' : spent >= CAPS.codex_tokens ? 'max-codex-tokens' : null
+  if (cap) {
+    if (!capPause) capPause = { paused_by: cap, first_blocked: opts.label || 'leg', agents_dispatched: agentCalls, codex_tokens_spent: spent, limits: CAPS, blocked: 0 }
+    capPause.blocked++
+    return null
+  }
+  agentCalls++
+  return track(await agent(p, opts))
+}
 const leg = async (effort, task, opts) => {
   const p = lint(['EFFORT: ' + effort, 'SANDBOX: read-only', 'CWD: ' + args.cwd, '', task].join('\n'))
-  let r = prose(track(await agent(p, { agentType: 'codex-worker', ...opts })))
-  if (!r) r = prose(track(await agent(p, { agentType: 'codex-worker', ...opts, label: (opts.label || 'leg') + ':retry' })))
+  let r = prose(await dispatch(p, { agentType: 'codex-worker', ...opts }))
+  if (!r) r = prose(await dispatch(p, { agentType: 'codex-worker', ...opts, label: (opts.label || 'leg') + ':retry' }))
   return r
 }
 
@@ -60,7 +77,7 @@ const reports = (await parallel(angles.map((a, i) => () =>
   ].join('\n'), { label: 'gpt-5.5:gather:' + i, phase: 'Gather' })
 ))).filter(Boolean)
 log(reports.length + '/' + angles.length + ' angle reports gathered')
-if (!reports.length) return { error: 'all gather legs failed', usage: usedTokens }
+if (!reports.length) return { error: 'all gather legs failed', paused_by_cap: capPause, usage: usedTokens }
 
 phase('Synthesize')
 // Reports are passed as FILE PATHS, never embedded: 4 x 6KB of inline report
@@ -73,7 +90,7 @@ const synthesis = await leg('xhigh', [
 ].join('\n'), { label: 'gpt-5.5:synthesize', phase: 'Synthesize' })
 if (!synthesis) {
   log('synthesis leg failed twice — returning raw angle reports')
-  return { error: 'synthesis leg failed', angle_reports: reports, usage: usedTokens }
+  return { error: 'synthesis leg failed', angle_reports: reports, paused_by_cap: capPause, usage: usedTokens }
 }
 const critique = await leg('high', [
   'Completeness critic. Question: ' + args.question,
@@ -81,10 +98,12 @@ const critique = await leg('high', [
   'What is missing, unverified, or assumed? Check the repo directly for the 2-3 most load-bearing claims. Return: verified claims (with command+output), gaps worth a follow-up, verdict solid|needs-work. <=30 lines.',
 ].join('\n'), { label: 'gpt-5.5:critique', phase: 'Synthesize' })
 log('codex spend this run: input=' + usedTokens.input + ' output=' + usedTokens.output + ' (NOT in harness budget)')
+if (capPause) log('PAUSED BY CAP: ' + capPause.paused_by + ' — ' + capPause.blocked + ' dispatches blocked after ' + capPause.agents_dispatched + ' agents / ' + capPause.codex_tokens_spent + ' codex tokens')
 return {
   synthesis: synthesis.text || ('[see file: ' + synthesis.file + ']'),
   synthesis_file: synthesis.file,
   critique: critique ? (critique.text || ('[see file: ' + critique.file + ']')) : null,
   angle_reports: reports.map(r => r.text || ('[see file: ' + r.file + ']')),
+  paused_by_cap: capPause,
   usage: usedTokens,
 }

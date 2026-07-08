@@ -37,6 +37,23 @@ const jsonOf = (r) => {
   if (a < 0 || b <= a) return null
   try { return JSON.parse(cleaned.slice(a, b + 1)) } catch { return null }
 }
+// Spend caps (ops-readiness 2026-07-08): hard per-run ceilings so a runaway
+// fan-out pauses with a receipt instead of spending silently. Override per run
+// via args.max_agents / args.max_codex_tokens. Complements the harness
+// `budget` global, which meters only Claude-side output tokens.
+const CAPS = { agents: +args.max_agents || Math.max(24, args.tasks.length * 8), codex_tokens: +args.max_codex_tokens || 12_000_000 }
+let agentCalls = 0, capPause = null
+const dispatch = async (p, opts) => {
+  const spent = usedTokens.input + usedTokens.output
+  const cap = agentCalls >= CAPS.agents ? 'max-agents' : spent >= CAPS.codex_tokens ? 'max-codex-tokens' : null
+  if (cap) {
+    if (!capPause) capPause = { paused_by: cap, first_blocked: opts.label || 'leg', agents_dispatched: agentCalls, codex_tokens_spent: spent, limits: CAPS, blocked: 0 }
+    capPause.blocked++
+    return null
+  }
+  agentCalls++
+  return track(await agent(p, opts))
+}
 
 const results = await pipeline(
   args.tasks,
@@ -50,8 +67,8 @@ const results = await pipeline(
       'CWD: ' + t.cwd,
       '',
       'Run `git rev-parse HEAD` and `git status --short` in the current directory and output both results verbatim, nothing else.',
-    ].join('\n'), { label: 'spark:pin:' + t.id, phase: 'Pin' })
-    const pin = gate(track(await agent(p, { agentType: 'codex-worker' })))
+    ].join('\n'))
+    const pin = gate(await dispatch(p, { agentType: 'codex-worker', label: 'spark:pin:' + t.id, phase: 'Pin' }))
     return { task: t, pin: pin ? pin.split('\n').filter(l => !/^\[codex-/.test(l)).join('\n').trim() : null }
   },
   // Implement: workspace-write, real writer effort
@@ -67,8 +84,8 @@ const results = await pipeline(
       'When done, output a <=25-line report: files changed/created (paths), what each does, ' +
       (t.test_cmd ? 'full output summary line of `' + t.test_cmd + '`, ' : '') +
       'and any deviation from the spec with why.',
-    ].join('\n'), { label: 'gpt-5.5:impl:' + t.id, phase: 'Implement' })
-    const r = gate(track(await agent(p, { agentType: 'codex-worker' })))
+    ].join('\n'))
+    const r = gate(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:impl:' + t.id, phase: 'Implement' }))
     const files = r && (r.match(/^\[codex-files-written: (\d+)\]/m) || [])[1]
     return { task: t, pin: pinned.pin, report: r, files_written: files ? +files : null }
   },
@@ -89,13 +106,14 @@ const results = await pipeline(
       'Required checks, each with the actual command + observed output: (1) rg every NEW public symbol for at least one caller outside its own file and its tests; (2) test count before (git stash-free: use git diff to infer) vs after vs the report\'s claims; (3) grep new tests for hedged assertions (`in (`, `or `, truthy-on-union); (4) run one live path' + (t.test_cmd ? ' including `' + t.test_cmd + '`' : '') + (impl.pin ? '; (5) `git rev-parse HEAD` + `git status --short` now vs the pinned state — HEAD must be UNCHANGED (the writer may not commit) and new dirt must match the report\'s file list' : '') + '.',
       'Output ONLY a single minified JSON object on one line, no fences, no prose:',
       '{"verdict":"pass|fail","defects":[{"summary":"...","evidence":"cmd + output"}],"commands_run":[{"cmd":"...","observed":"..."}]}',
-    ].filter(Boolean).join('\n'), { label: 'gpt-5.5:verify:' + t.id, phase: 'Post-verify' })
-    let v = jsonOf(gate(track(await agent(p, { agentType: 'codex-worker' }))) || '')
-    if (!v) v = jsonOf(gate(track(await agent(p, { agentType: 'codex-worker', label: 'gpt-5.5:verify:' + t.id + ':retry' }))) || '')
+    ].filter(Boolean).join('\n'))
+    let v = jsonOf(gate(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:verify:' + t.id, phase: 'Post-verify' })) || '')
+    if (!v) v = jsonOf(gate(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:verify:' + t.id + ':retry', phase: 'Post-verify' })) || '')
     if (v && v.codex_file) v = { verdict: 'oversized-output', codex_file: v.codex_file, defects: [], commands_run: [] }
     else if (v && (!Array.isArray(v.commands_run) || !v.commands_run.length)) v = { verdict: 'invalid-no-evidence', defects: [], commands_run: [] }
     return { ...impl, verify: v || { verdict: 'verifier-failed', reason: 'no parseable verdict after retry' } }
   },
 )
 log('codex spend this run: input=' + usedTokens.input + ' output=' + usedTokens.output + ' (NOT in harness budget)')
-return { results: results.filter(Boolean), usage: usedTokens }
+if (capPause) log('PAUSED BY CAP: ' + capPause.paused_by + ' — ' + capPause.blocked + ' dispatches blocked after ' + capPause.agents_dispatched + ' agents / ' + capPause.codex_tokens_spent + ' codex tokens')
+return { results: results.filter(Boolean), paused_by_cap: capPause, usage: usedTokens }

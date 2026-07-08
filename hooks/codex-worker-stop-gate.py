@@ -12,9 +12,11 @@ check (2026-07-08 placeholder incident); it now gets blocked once with a
 poll-and-recover instruction, as does a final message abandoned at
 CODEX_RUNNING. Self-execution without any runner call blocks with the
 forwarding re-instruction (2026-07-07 incident: 16/16 Workflow forwarders
-answered tasks themselves). Second stops always pass (no infinite loops) but
-an unproven second stop logs a violation line so misfires stay measurable.
-One line per decision appended to codex-gate.log.
+answered tasks themselves). A footers-only final (body stripped by the relay,
+2026-07-08 incident: 4 legs) blocks once with the exact
+`codex-run.sh --footer --recover <session>` command. Second stops always pass
+(no infinite loops) but an unproven second stop logs a violation line so
+misfires stay measurable. One line per decision appended to codex-gate.log.
 """
 import json, re, sys, time, os
 
@@ -22,8 +24,14 @@ DIRECTIVE = re.compile(r'^(EFFORT|SANDBOX|CWD|NETWORK|MCP|MODEL|RESUME|LONG|SCHE
 # Footer proof in the final message — the runner prints `missing` when it
 # couldn't extract a session id, which is a misfire, not proof. Anchored to
 # line start (like every parseCodex caller) so prose QUOTING a footer never
-# counts.
-SESSION_FOOTER = re.compile(r'^\[codex-session: (?!missing)\S+\]', re.M)
+# counts. Captures the id so block reasons can hand back the exact
+# `--recover <id>` command.
+SESSION_FOOTER = re.compile(r'^\[codex-session: (?!missing)(\S+)\]', re.M)
+# Telemetry footers are NOT content: a final message that is footers-only
+# means the relay dropped the body (2026-07-08: 4 legs ran ok, returned
+# stripped finals twice, content stranded in the archive). The
+# [codex-final-file:] envelope IS content — deliberately not in this set.
+FOOTER_LINE = re.compile(r'^\s*\[codex-(session|usage|files-written):')
 # Path-form invocation of the runner (also matches the printed --poll continuation);
 # an `echo codex-run.sh` or a mention inside other text does not count.
 # Keep in sync with RUNNER_CALL in executable_codex-worker-bright-line.py —
@@ -110,7 +118,15 @@ def main():
     if head.startswith('CODEX_ERROR'):
         log('allow', 'loud-failure')
         return
-    if forwarded and (SESSION_FOOTER.search(last_assistant) or structured):
+    sess = SESSION_FOOTER.search(last_assistant)
+    # A "content" line has a visible glyph that is not a footer — zero-width
+    # and BOM chars don't count (v3.5 review gb-2: U+200B survived .strip()
+    # and masked a stripped relay as real content).
+    def visible(l):
+        return bool(re.sub(r'[\s​‌‍⁠﻿]', '', l))
+    has_content = any(visible(l) and not FOOTER_LINE.match(l)
+                      for l in last_assistant.splitlines())
+    if forwarded and (structured or (sess and has_content)):
         log('allow', 'forwarded+proof')
         return
     if j.get('stop_hook_active'):           # already blocked once — never loop, but keep misfires measurable
@@ -118,6 +134,21 @@ def main():
         log_violation(j)
         return
     log_violation(j)
+    # Only a well-formed session id may be embedded in the recovery command —
+    # a prompt-injected fake footer could otherwise smuggle shell metachars
+    # into a command the forwarder will run inside an allowed runner segment.
+    if forwarded and sess and re.fullmatch(r'[0-9a-fA-F-]+', sess.group(1)):
+        # Footers survived but the body didn't — a stripped relay. Recovery is
+        # deterministic: the runner re-emits content + footers from its archive.
+        log('block', 'footers without content (stripped relay)')
+        print(json.dumps({
+            'decision': 'block',
+            'reason': ('codex-worker contract violation: your final message carries the [codex-session:] footer but '
+                       'no content — the relay dropped the body. Recover it mechanically: run '
+                       '`~/.claude/agents/bin/codex-run.sh --footer --recover ' + sess.group(1) + '` and return that '
+                       'stdout VERBATIM (content + footers). Never retype the result from memory.'),
+        }))
+        return
     if forwarded:
         # Runner was invoked but the final message carries no result: an
         # abandoned CODEX_RUNNING, a "waiting for the review..." placeholder,
@@ -128,9 +159,11 @@ def main():
             'reason': ('codex-worker contract violation: you invoked codex-run.sh but your final message has no '
                        '[codex-session:] footer — never return placeholder text like "the task is still running". '
                        'If the runner printed CODEX_RUNNING, run its printed --poll continuation command now and '
-                       'repeat until it resolves (the detached run survives between your tool calls). Then return '
-                       'that stdout VERBATIM including the [codex-session:]/[codex-usage:] footers, or the '
-                       'CODEX_ERROR line if it failed.'),
+                       'repeat until it resolves (the detached run survives between your tool calls). If the runner '
+                       'already finished (its stdout with a [codex-session: <id>] footer appeared in an earlier tool '
+                       'result), run `~/.claude/agents/bin/codex-run.sh --footer --recover <that session id>` to '
+                       're-emit it. Either way, return that stdout VERBATIM including the '
+                       '[codex-session:]/[codex-usage:] footers, or the CODEX_ERROR line if it failed.'),
         }))
         return
     log('block', 'no codex invocation in transcript')

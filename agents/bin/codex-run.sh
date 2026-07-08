@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# codex-run.sh — deterministic runner for the codex-worker contract (v3.3).
+# codex-run.sh — deterministic runner for the codex-worker contract (v3.5).
 # Launch mode: reads the task text on stdin, launches codex detached, polls.
 # Poll mode (--poll <scratch>): resumes polling a still-running launch.
+# Recover mode (--recover <session-id>): re-emit a completed run's content +
+# footers from the archive + usage.log — the mechanical fix when a relay was
+# stripped or lost (never retype results from memory).
 # Review mode (--review uncommitted|custom|base=<branch>|commit=<sha>): runs
 # codex's native review harness in an isolated CODEX_HOME; results extracted
 # from session rollouts (review has no --json/-o on codex 0.142.x).
@@ -19,7 +22,7 @@ set -u
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 MODEL=gpt-5.5 EFFORT=medium SANDBOX=workspace-write CWD="$PWD"
 NETWORK=0 MCP="" SCHEMA="" SCHEMA_FILE="" RESUME="" RETRY_SAFE=0
-POLL="" BUDGET=540 FOOTER=0 REVIEW="" EXTRACT="" OUTPUT_FILE=""
+POLL="" BUDGET=540 FOOTER=0 REVIEW="" EXTRACT="" OUTPUT_FILE="" RECOVER=""
 WORKER_HOME="$HOME/.codex-worker"
 RELAY_MAX="${CODEX_RELAY_MAX:-8192}"
 case "$RELAY_MAX" in ''|*[!0-9]*) RELAY_MAX=8192 ;; esac
@@ -39,6 +42,7 @@ while [ $# -gt 0 ]; do
     --output-file) OUTPUT_FILE=$2; shift 2 ;;
     --retry-safe) RETRY_SAFE=1; shift ;;
     --poll) POLL=$2; shift 2 ;;
+    --recover) RECOVER=$2; shift 2 ;;
     --poll-budget) BUDGET=$2; shift 2 ;;
     --footer) FOOTER=1; shift ;;
     --extract-review) EXTRACT=$2; shift 2 ;;
@@ -91,6 +95,33 @@ if totals:
 open(f"{S}/telemetry", "w").write(f"{session}\n{usage}\n")
 PYEOF
   exit $?
+fi
+
+# Recover mode: re-emit a completed run's caller-contract output from the
+# archive (content) + usage.log (telemetry). Deterministic — no model in the
+# loop — so a wrapper whose relay was stripped/garbled can regenerate the
+# exact footer block instead of retyping from memory (2026-07-08: 4 legs ran
+# ok but returned footer-less finals; recovery via cat was gate-denied).
+if [ -n "$RECOVER" ]; then
+  case "$RECOVER" in
+    *[!0-9a-fA-F-]*|'') echo "CODEX_ERROR: --recover takes a session id, got '$RECOVER'"; exit 2 ;;
+  esac
+  ARCHIVE="$WORKER_HOME/results/$RECOVER.txt"
+  [ -f "$ARCHIVE" ] || { echo "CODEX_ERROR: no archived result for session $RECOVER (archive keeps 7 days; check $WORKER_HOME/usage.log for the ok line)"; exit 2; }
+  LINE=$(grep -F "ok session=$RECOVER " "$WORKER_HOME/usage.log" 2>/dev/null | tail -1)
+  USAGE=$(printf '%s' "$LINE" | grep -oE 'input=[0-9]+ cached=[0-9]+ output=[0-9]+ reasoning=[0-9]+' | head -1)
+  [ -n "$USAGE" ] || USAGE=missing
+  BYTES=$(wc -c < "$ARCHIVE")
+  if [ "$BYTES" -gt "$RELAY_MAX" ]; then
+    echo "[codex-final-file: $ARCHIVE bytes=$BYTES]"
+  else
+    cat "$ARCHIVE"; echo
+  fi
+  echo "[codex-session: $RECOVER]"
+  echo "[codex-usage: $USAGE]"
+  FILES=$(printf '%s' "$LINE" | grep -oE ' files=[0-9]+' | grep -oE '[0-9]+')
+  [ -n "$FILES" ] && echo "[codex-files-written: $FILES]"
+  exit 0
 fi
 
 # Reject garbage before it becomes a real directory or generated shell: an
@@ -197,9 +228,7 @@ emit_footer() { # $1=status $2=scratch
     emit_final_content "$2"
     echo "[codex-session: $SESSION]"
     echo "[codex-usage: $USAGE]"
-    if [ "$(sed -n 2p "$2/meta")" = workspace-write ]; then
-      echo "[codex-files-written: $(files_written "$2" | grep -c .)]"
-    fi
+    [ -n "$FILES_N" ] && echo "[codex-files-written: $FILES_N]"
   elif [ "$1" = running ]; then
     echo "CODEX_RUNNING: re-invoke with: $0 --footer --poll $2"
   else
@@ -239,10 +268,11 @@ emit_block() { # $1=status $2=scratch $3=keep (yes|no)
   if [ "$status" = ok ] && { [ "$USAGE" = missing ] || [ "$SESSION" = missing ]; }; then
     status=error; keep=yes
   fi
-  RELAY=inline FINAL_FILE="" BYTES=0 ARCHIVE="" KEEP_SCRATCH=0
+  RELAY=inline FINAL_FILE="" BYTES=0 ARCHIVE="" KEEP_SCRATCH=0 FILES_N=""
   [ "$status" = ok ] && prepare_final "$S"
+  [ "$status" = ok ] && [ "$(sed -n 2p "$S/meta")" = workspace-write ] && FILES_N=$(files_written "$S" | grep -c .)
   [ "$KEEP_SCRATCH" = 1 ] && keep=yes
-  [ "$status" = running ] || { mkdir -p "$WORKER_HOME" && echo "$(date -Is) $status session=$SESSION $USAGE cwd=$(sed -n 1p "$S/meta" 2>/dev/null)${ARCHIVE:+ file=$ARCHIVE}" >> "$WORKER_HOME/usage.log"; } 2>/dev/null
+  [ "$status" = running ] || { mkdir -p "$WORKER_HOME" && echo "$(date -Is) $status session=$SESSION $USAGE${FILES_N:+ files=$FILES_N} cwd=$(sed -n 1p "$S/meta" 2>/dev/null)${ARCHIVE:+ file=$ARCHIVE}" >> "$WORKER_HOME/usage.log"; } 2>/dev/null
   if [ "$FOOTER" = 1 ]; then emit_footer "$status" "$S"; else emit_envelope "$status" "$S" "$keep"; fi
   [ "$status" = ok ] && [ "$keep" = no ] && rm -rf "$S"
 }

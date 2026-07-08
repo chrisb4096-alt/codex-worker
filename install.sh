@@ -29,6 +29,7 @@ WANTED = [
     ('PreToolUse', 'Workflow', hook('python3 ~/.claude/hooks/workflow-args-gate.py', 10)),
     ('PreToolUse', 'Bash', hook('python3 ~/.claude/hooks/codex-worker-bright-line.py', 5)),
     ('SubagentStop', None, hook('python3 ~/.claude/hooks/codex-worker-stop-gate.py', 15)),
+    ('SubagentStart', 'codex-worker', hook('python3 ~/.claude/hooks/codex-worker-start-context.py', 5)),
 ]
 hooks = settings.setdefault('hooks', {})
 for event, matcher, h in WANTED:

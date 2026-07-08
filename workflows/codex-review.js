@@ -30,10 +30,27 @@ const parseCodex = (r) => {
   if (a < 0 || b <= a) return null
   try { return JSON.parse(cleaned.slice(a, b + 1)) } catch { return null }
 }
+// Spend caps (ops-readiness 2026-07-08): hard per-run ceilings so a runaway
+// fan-out pauses with a receipt instead of spending silently. Override per run
+// via args.max_agents / args.max_codex_tokens. Complements the harness
+// `budget` global, which meters only Claude-side output tokens.
+const CAPS = { agents: +args.max_agents || 80, codex_tokens: +args.max_codex_tokens || 10_000_000 }
+let agentCalls = 0, capPause = null
+const dispatch = async (p, opts) => {
+  const spent = usedTokens.input + usedTokens.output
+  const cap = agentCalls >= CAPS.agents ? 'max-agents' : spent >= CAPS.codex_tokens ? 'max-codex-tokens' : null
+  if (cap) {
+    if (!capPause) capPause = { paused_by: cap, first_blocked: opts.label || 'leg', agents_dispatched: agentCalls, codex_tokens_spent: spent, limits: CAPS, blocked: 0 }
+    capPause.blocked++
+    return null
+  }
+  agentCalls++
+  return track(await agent(p, opts))
+}
 const leg = async (effort, task, opts) => {
   const p = lint(['EFFORT: ' + effort, 'SANDBOX: read-only', 'CWD: ' + args.cwd, '', task].join('\n'))
-  let v = parseCodex(track(await agent(p, { agentType: 'codex-worker', ...opts })))
-  if (!v) v = parseCodex(track(await agent(p, { agentType: 'codex-worker', ...opts, label: (opts.label || 'leg') + ':retry' })))
+  let v = parseCodex(await dispatch(p, { agentType: 'codex-worker', ...opts }))
+  if (!v) v = parseCodex(await dispatch(p, { agentType: 'codex-worker', ...opts, label: (opts.label || 'leg') + ':retry' }))
   return v
 }
 
@@ -64,8 +81,8 @@ const finders = DIMS.map(d => () =>
 const nativeTarget = args.review_target || null
 if (nativeTarget) finders.push(async () => {
   const p = lint(['EFFORT: medium', 'CWD: ' + args.cwd, 'REVIEW: ' + nativeTarget].join('\n'))
-  let v = parseCodex(track(await agent(p, { agentType: 'codex-worker', label: 'gpt-5.5:find:native-review', phase: 'Find' })))
-  if (!v) v = parseCodex(track(await agent(p, { agentType: 'codex-worker', label: 'gpt-5.5:find:native-review:retry', phase: 'Find' })))
+  let v = parseCodex(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:find:native-review', phase: 'Find' }))
+  if (!v) v = parseCodex(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:find:native-review:retry', phase: 'Find' }))
   if (v && v.codex_file) return v   // oversized: let the shared handler surface the file
   if (!v || !Array.isArray(v.findings)) return null
   return { findings: v.findings.map((f, i) => ({ ...normalizeFinding(f), id: 'native-' + (i + 1) })) }
@@ -101,7 +118,7 @@ const found = rawFound.filter(f => {
   seenLoc.add(k); return true
 })
 log(found.length + ' candidate findings (' + (rawFound.length - found.length) + ' cross-finder dupes dropped)')
-if (!found.length) return { confirmed: [], refuted: [], oversized_finder_files: oversized, usage: usedTokens }
+if (!found.length) return { confirmed: [], refuted: [], oversized_finder_files: oversized, paused_by_cap: capPause, usage: usedTokens }
 
 phase('Verify')
 const verdicts = await parallel(found.map(f => () =>
@@ -126,11 +143,13 @@ const judged = verdicts.filter(Boolean).map(({ finding, v }) => (
       }
 ))
 log('codex spend this run: input=' + usedTokens.input + ' output=' + usedTokens.output + ' (NOT in harness budget)')
+if (capPause) log('PAUSED BY CAP: ' + capPause.paused_by + ' — ' + capPause.blocked + ' dispatches blocked after ' + capPause.agents_dispatched + ' agents / ' + capPause.codex_tokens_spent + ' codex tokens')
 return {
   confirmed: judged.filter(j => j.verdict === 'confirmed'),
   refuted: judged.filter(j => j.verdict === 'refuted'),        // keep — refutations prevent re-flagging
   needs_rework: judged.filter(j => j.verdict === 'invalid-no-evidence'),
   oversized_verdicts: judged.filter(j => j.verdict === 'oversized-verifier-output'),
   oversized_finder_files: oversized,
+  paused_by_cap: capPause,
   usage: usedTokens,
 }

@@ -6,15 +6,16 @@ The result, measured on real workloads: a comparable multi-agent code review cos
 
 ## What this is
 
-Claude Code's `Agent` tool and `Workflow` tool can spawn subagents of a custom type. This repo defines one: `codex-worker`, a deliberately thin forwarder whose only job is to pipe a task to the Codex CLI and relay the answer back verbatim. Around it sit a runner script, three enforcement hooks, and three ready-made workflow templates.
+Claude Code's `Agent` tool and `Workflow` tool can spawn subagents of a custom type. This repo defines one: `codex-worker`, a deliberately thin forwarder whose only job is to pipe a task to the Codex CLI and relay the answer back verbatim. Around it sit a runner script, four enforcement hooks, and three ready-made workflow templates.
 
 - `agents/codex-worker.md` — the subagent contract (runs on a small, cheap Claude model; it forwards, it never thinks)
-- `agents/bin/codex-run.sh` — the runner: launches `codex exec` detached, polls, relays output with proof footers, archives results
+- `agents/bin/codex-run.sh` — the runner: launches `codex exec` detached, polls, relays output with proof footers, archives results, re-emits lost relays (`--recover`)
 - `hooks/codex-worker-bright-line.py` — PreToolUse gate: a codex-worker leg may only invoke the runner, nothing else
 - `hooks/codex-worker-stop-gate.py` — SubagentStop gate: a leg may not finish without proof it actually forwarded
+- `hooks/codex-worker-start-context.py` — SubagentStart injector: refreshes the contract in every leg's context before its first turn
 - `hooks/workflow-args-gate.py` — PreToolUse gate on the Workflow tool: catches double-encoded args and unguarded scripts at dispatch
 - `workflows/` — `codex-review`, `codex-implement-verify`, `codex-research` templates
-- `tests/test_gates.py` — 26-case unit matrix for the three gates (stdlib only)
+- `tests/test_gates.py` — 42-case unit matrix for the hooks (stdlib only)
 
 ## How it works
 
@@ -37,13 +38,14 @@ Key design points:
 
 ## The failure modes, and the gates that kill them
 
-We ran this in anger for weeks. The forwarder model fails in three characteristic ways, and each gate exists because prompting could not fully prevent one of them:
+We ran this in anger for weeks. The forwarder model fails in four characteristic ways, and each gate exists because prompting could not fully prevent one of them:
 
 1. **Self-execution.** The forwarder answers the task itself instead of forwarding — confidently, plausibly, on a model far too small for the work. In our worst incident, 16 of 16 workflow legs did this and the fan-out silently ran on a haiku-class model. Killed by the **bright-line gate** (PreToolUse): inside a codex-worker leg, every Bash command is parsed segment by segment and denied unless it is a runner invocation or trivial staging (`pwd`, `mktemp`, writing a schema tempfile). A forwarder that cannot read files cannot answer questions about them.
 2. **Placeholder returns.** The forwarder launches the run, never polls, and returns "the task is still running..." as its final answer. Killed by the **stop gate** (SubagentStop): the final message must carry a non-`missing` session footer, a leading `CODEX_ERROR`, or a StructuredOutput submission that followed a real runner call. A runner invocation earlier in the transcript is not proof. Blocked legs get one poll-and-recover instruction; unproven second stops are logged as violations so misfire rates stay measurable.
 3. **Corrupted dispatch.** Workflow args passed as a JSON-encoded string instead of an object read as `undefined` in the script — silently — and interpolate the literal string `undefined` into every worker prompt. Killed by the **args gate** (PreToolUse on Workflow): genuinely double-encoded args are denied with an explanation the orchestrator can act on, and scripts that read `args.*` without a parse-or-throw guard are denied until they add one.
+4. **Stripped relays.** The forwarder keeps the proof footers but drops the body — the result looks authenticated and is empty. Killed by the **stop gate**: a footers-only final message blocks once with the exact recovery command (`codex-run.sh --footer --recover <session>`), which re-emits content + footers deterministically from the runner's archive. No model retyping, no re-run spend.
 
-All three gates fail open on malformed input — they must never block valid work — and log one line per decision so you can audit them.
+The gates fail open on malformed input — they must never block valid work — and log one line per decision so you can audit them. A fifth, softer layer runs before any of this: a **SubagentStart injector** puts a compact contract reminder into every leg's context before its first turn, which in practice prevents most violations the other gates would otherwise have to catch (each catch costs a burned turn).
 
 ## The contract
 
@@ -59,7 +61,7 @@ A codex-worker task is plain text, optionally opened by directive lines:
 - `OUTPUT_FILE: /abs/path` — write the result to a file instead of relaying it
 - `RESUME: <session-uuid>`, `LONG: on`, `MCP: server1,server2` — session continuation, extended timeout, MCP servers
 
-The full contract, including the caller-side parsing snippet, lives in [`agents/codex-worker.md`](agents/codex-worker.md).
+The full contract, including the caller-side parsing snippet and a routing rubric (which model and effort per leg role, and which legs should NOT be codex workers), lives in [`agents/codex-worker.md`](agents/codex-worker.md).
 
 Callers treat worker output as evidence, not authority. The canonical `parseCodex` helper (used by all three bundled workflows) rejects anything without a valid session footer, unwraps file-relay envelopes, and brace-extracts JSON so a stray fence doesn't kill a leg. Failed legs retry once, then surface as failures — never as silently missing data.
 
@@ -76,11 +78,12 @@ Prerequisites:
 - Codex CLI installed and logged in (`codex login`) — a ChatGPT Plus/Pro subscription or OpenAI API key
 - `python3` for the hooks
 
-`install.sh` copies `agents/`, `hooks/`, and `workflows/` into `~/.claude/`, then merges three hook entries into `~/.claude/settings.json` (backing up the original):
+`install.sh` copies `agents/`, `hooks/`, and `workflows/` into `~/.claude/`, then merges four hook entries into `~/.claude/settings.json` (backing up the original):
 
 - PreToolUse, matcher `Workflow` → `workflow-args-gate.py`
 - PreToolUse, matcher `Bash` → `codex-worker-bright-line.py`
 - SubagentStop (no matcher) → `codex-worker-stop-gate.py`
+- SubagentStart, matcher `codex-worker` → `codex-worker-start-context.py`
 
 Then, from any Claude Code session:
 
@@ -143,7 +146,7 @@ Read `agents/codex-worker.md` for the contract, then `agents/bin/codex-run.sh` �
 python3 tests/test_gates.py
 ```
 
-26 cases covering all three gates as subprocesses with an isolated `$HOME`, exercising the real stdin/stdout hook contract — including regression cases for each production incident above.
+42 cases covering all four hooks as subprocesses with an isolated `$HOME`, exercising the real stdin/stdout hook contract — including regression cases for each production incident above.
 
 ## License
 
