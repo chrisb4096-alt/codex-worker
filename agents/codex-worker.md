@@ -181,9 +181,12 @@ runner's archive.
     const f = r.match(/^\[codex-final-file: (\S+) bytes=(\d+)\]/m)  // file-relay envelope
     if (f) return { codex_file: f[1], codex_bytes: +f[2] }
     const cleaned = r.split('\n').filter(l => !/^\[codex-/.test(l)).join('\n')
-    const a = cleaned.indexOf('{'), b = cleaned.lastIndexOf('}')
-    if (a < 0 || b <= a) return null
-    try { return JSON.parse(cleaned.slice(a, b + 1)) } catch { return null }
+    for (const [open, close] of [['{', '}'], ['[', ']']]) {
+      const a = cleaned.indexOf(open), b = cleaned.lastIndexOf(close)
+      if (a < 0 || b <= a) continue
+      try { return JSON.parse(cleaned.slice(a, b + 1)) } catch {}
+    }
+    return null
   }
   ```
 
