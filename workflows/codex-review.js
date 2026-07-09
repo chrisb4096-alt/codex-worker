@@ -14,15 +14,32 @@ args = args || {}
 if (!args.cwd || !String(args.cwd).startsWith('/')) throw new Error('args.cwd (absolute repo path) required — pass args as an object, not a JSON string')
 const lint = (p) => { const m = p.match(/undefined\/|: undefined\b|\[object Object\]/); if (m) throw new Error('unresolved variable in prompt: ' + m[0]); return p }
 const usedTokens = { input: 0, output: 0, reasoning: 0 }
-const track = (r) => {
+const codexSessions = []
+const runningLegs = []
+const SESSION_RE = /^\[codex-session: ((?!missing)[0-9a-fA-F-]{8,})\]/m
+const isRunning = (r) => typeof r === 'string' && /^\s*CODEX_RUNNING:/.test(r)
+const track = (r, label) => {
   const m = typeof r === 'string' && r.match(/^\[codex-usage: input=(\d+) cached=\d+ output=(\d+)(?: reasoning=(\d+))?/m)
   if (m) { usedTokens.input += +m[1]; usedTokens.output += +m[2]; usedTokens.reasoning += +(m[3] || 0) }
+  const s = typeof r === 'string' && r.match(SESSION_RE)
+  if (s) codexSessions.push({ label: label || 'leg', session: s[1] })
+  if (isRunning(r)) runningLegs.push({ label: label || 'leg', continuation: r.trim() })
   return r
 }
+const proofReceipt = () => ({
+  workflow_proof: {
+    status: codexSessions.length ? 'UNVERIFIED' : 'NO_SESSIONS',
+    required: codexSessions.length > 0,
+    sessions: codexSessions,
+    verify_command: codexSessions.length ? '~/.claude/agents/bin/codex-run.sh --verify ' + codexSessions.map(s => s.session).join(',') : null,
+    instruction: codexSessions.length ? 'Run verify_command and discard the entire Workflow result if any line says forged.' : null,
+  },
+  running_legs: runningLegs,
+})
 const parseCodex = (r) => {
   if (!r || typeof r !== 'string') return null
   if (r.trimStart().startsWith('CODEX_ERROR')) return null
-  if (!/^\[codex-session: (?!missing)\S+\]/m.test(r)) return null   // no session = codex never ran
+  if (!SESSION_RE.test(r)) return null   // no session = codex never ran
   const f = r.match(/^\[codex-final-file: (\S+) bytes=(\d+)\]/m)    // >8KB rode the file relay
   if (f) return { codex_file: f[1], codex_bytes: +f[2] }
   const cleaned = r.split('\n').filter(l => !/^\[codex-/.test(l)).join('\n')
@@ -48,12 +65,16 @@ const dispatch = async (p, opts) => {
     return null
   }
   agentCalls++
-  return track(await agent(p, opts))
+  return track(await agent(p, opts), opts.label)
 }
+// A still-running detached run returns CODEX_RUNNING (which parses to null);
+// re-dispatching the same prompt would launch a DUPLICATE run (v3.7 audit).
+// Only retry a clean failure, never a run that is still in flight.
 const leg = async (effort, task, opts) => {
   const p = lint(['EFFORT: ' + effort, 'SANDBOX: read-only', 'CWD: ' + args.cwd, '', task].join('\n'))
-  let v = parseCodex(await dispatch(p, { agentType: 'codex-worker', ...opts }))
-  if (!v) v = parseCodex(await dispatch(p, { agentType: 'codex-worker', ...opts, label: (opts.label || 'leg') + ':retry' }))
+  const raw1 = await dispatch(p, { agentType: 'codex-worker', ...opts })
+  let v = parseCodex(raw1)
+  if (!v && !isRunning(raw1)) v = parseCodex(await dispatch(p, { agentType: 'codex-worker', ...opts, label: (opts.label || 'leg') + ':retry' }))
   return v
 }
 
@@ -84,8 +105,9 @@ const finders = DIMS.map(d => () =>
 const nativeTarget = args.review_target || null
 if (nativeTarget) finders.push(async () => {
   const p = lint(['EFFORT: high', 'CWD: ' + args.cwd, 'REVIEW: ' + nativeTarget].join('\n'))
-  let v = parseCodex(await dispatch(p, { agentType: 'codex-worker', label: 'sol:find:native-review', phase: 'Find' }))
-  if (!v) v = parseCodex(await dispatch(p, { agentType: 'codex-worker', label: 'sol:find:native-review:retry', phase: 'Find' }))
+  const raw1 = await dispatch(p, { agentType: 'codex-worker', label: 'sol:find:native-review', phase: 'Find' })
+  let v = parseCodex(raw1)
+  if (!v && !isRunning(raw1)) v = parseCodex(await dispatch(p, { agentType: 'codex-worker', label: 'sol:find:native-review:retry', phase: 'Find' }))
   if (v && v.codex_file) return v   // oversized: let the shared handler surface the file
   if (!v || !Array.isArray(v.findings)) return null
   return { findings: v.findings.map((f, i) => ({ ...normalizeFinding(f), id: 'native-' + (i + 1) })) }
@@ -106,7 +128,19 @@ const normalizeFinding = (f) => ({
 // cap instruction — its findings are on disk, not iterable here. Surface the
 // path for the orchestrator instead of silently dropping the leg.
 const oversized = []
-const rawFound = (await parallel(finders)).filter(Boolean).flatMap(r => {
+const finderResults = await parallel(finders)
+// A leg counts as OK only if it produced a real shape (a findings array or an
+// oversized-output file). parseCodex can return a truthy `{}`/`[]` from a
+// degenerate codex reply, which `filter(Boolean)` counted as success — every
+// leg returning `{}` gave findersOk>0 with zero findings, sneaking back the
+// exact clean-looking "found nothing" the guard below exists to catch (v3.7 review).
+const findersOk = finderResults.filter(r => r && (Array.isArray(r.findings) || r.codex_file)).length
+// All finders failing (no codex output) is NOT a clean review — returning
+// confirmed:[] there masked total fan-out failure as "found nothing" (v3.7
+// audit; the 2026-07-08 "0 findings from 44 candidates" class). Fail loud.
+if (runningLegs.length) return { status: 'running', error: 'one or more finder legs are still running — poll the returned continuations; do not re-dispatch', finders_ok: findersOk, finders_total: finders.length, paused_by_cap: capPause, usage: usedTokens, ...proofReceipt() }
+if (!findersOk) return { error: 'all ' + finders.length + ' finder legs failed to produce codex output — this is NOT a clean review; check ~/.codex-worker/usage.log before any re-run', finders_ok: 0, finders_total: finders.length, paused_by_cap: capPause, usage: usedTokens, ...proofReceipt() }
+const rawFound = finderResults.filter(Boolean).flatMap(r => {
   if (r.codex_file) { oversized.push(r.codex_file); return [] }
   return (r.findings || []).filter(f => f && typeof f === 'object').map(normalizeFinding)
 })
@@ -121,7 +155,17 @@ const found = rawFound.filter(f => {
   seenLoc.add(k); return true
 })
 log(found.length + ' candidate findings (' + (rawFound.length - found.length) + ' cross-finder dupes dropped)')
-if (!found.length) return { confirmed: [], refuted: [], oversized_finder_files: oversized, paused_by_cap: capPause, usage: usedTokens }
+// A clean 'complete' review requires EVERY dimension to have produced output and
+// no spend-cap pause. One empty finder plus three cap-blocked ones is partial
+// coverage, not "found nothing" — flag it so zero findings isn't read as clean
+// (v3.7 high review; the 2026-07-08 "0 findings masks partial failure" class).
+const partialWarn = () => 'only ' + findersOk + '/' + finders.length + ' review dimensions produced output' +
+  (capPause ? ' (spend cap hit)' : '') + ' — partial coverage; zero/confirmed findings reflect only the dimensions that ran'
+if (!found.length) {
+  const incomplete = capPause || findersOk < finders.length
+  return { status: incomplete ? 'incomplete' : 'complete', ...(incomplete ? { warning: partialWarn() } : {}),
+    confirmed: [], refuted: [], finders_ok: findersOk, finders_total: finders.length, oversized_finder_files: oversized, paused_by_cap: capPause, usage: usedTokens, ...proofReceipt() }
+}
 
 phase('Verify')
 const verdicts = await parallel(found.map(f => () =>
@@ -145,14 +189,21 @@ const judged = verdicts.filter(Boolean).map(({ finding, v }) => (
         evidence: v ? v.commands_run : [],
       }
 ))
+if (runningLegs.length) return { status: 'running', error: 'one or more verifier legs are still running — poll the returned continuations; do not trust partial verdicts', candidates: found, paused_by_cap: capPause, usage: usedTokens, ...proofReceipt() }
 log('codex spend this run: input=' + usedTokens.input + ' output=' + usedTokens.output + ' (NOT in harness budget)')
 if (capPause) log('PAUSED BY CAP: ' + capPause.paused_by + ' — ' + capPause.blocked + ' dispatches blocked after ' + capPause.agents_dispatched + ' agents / ' + capPause.codex_tokens_spent + ' codex tokens')
+const incomplete = capPause || findersOk < finders.length
 return {
+  status: incomplete ? 'incomplete' : 'complete',
+  ...(incomplete ? { warning: partialWarn() } : {}),
   confirmed: judged.filter(j => j.verdict === 'confirmed'),
   refuted: judged.filter(j => j.verdict === 'refuted'),        // keep — refutations prevent re-flagging
   needs_rework: judged.filter(j => j.verdict === 'invalid-no-evidence'),
   oversized_verdicts: judged.filter(j => j.verdict === 'oversized-verifier-output'),
   oversized_finder_files: oversized,
+  finders_ok: findersOk,
+  finders_total: finders.length,
   paused_by_cap: capPause,
   usage: usedTokens,
+  ...proofReceipt(),
 }

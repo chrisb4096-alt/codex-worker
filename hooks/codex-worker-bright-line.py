@@ -19,36 +19,44 @@ agents.
 """
 import json, re, sys, time, os
 
-# Keep in sync with RUNNER_CALL in executable_codex-worker-stop-gate.py —
-# PreToolUse must never allow a form the stop-gate refuses to count as proof.
+sys.path.insert(0, os.path.dirname(__file__))
+from codex_worker_gate_common import (  # noqa: E402
+    runner_seg_ok,
+    shell_segments,
+    simple_shell_variables,
+)
+
+# The runner path (RUNNER_CALL in codex_worker_gate_common.py, applied via
+# runner_seg_ok) must never allow a form the stop-gate refuses to count as proof.
+# The runner path MUST include the `.claude/agents/bin/` prefix: a bare
 # The runner path MUST include the `.claude/agents/bin/` prefix: a bare
 # `/codex-run.sh` tail let a forwarder `cat > /tmp/codex-run.sh` (an allowed
 # heredoc write) then exec `/tmp/codex-run.sh` (both gate-approved) — a
 # write-then-exec bypass (v3.5 high review). A single heredoc segment cannot
 # build the nested `.claude/agents/bin/` dir, so requiring it closes the hole.
-RUNNER_CALL = re.compile(r'(?:^|[\s;&|(])(?:~|\$HOME|/\S+?)/\.claude/agents/bin/codex-run\.sh(?:\s|$)')
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1")
-SEG_OK = [re.compile(p) for p in (
-    r'^$',
-    r'^pwd$',
-    r'^[A-Za-z_]\w*=\$\(\s*mktemp(\s[^()]*)?\s*\)$',            # SCHEMA_FILE=$(mktemp)
-    r'^mktemp(\s\S+)*$',
-    r"^read\s+-r\s+-d\s+''\s+\w+\s*(<<-?\s*'?\w+'?)?$",         # task staging
-    # pipe feed, no redirects. printf MUST carry a single-quoted format
-    # literal — a bare `printf "$TASK"` treats task bytes as the format
-    # string and corrupts %-sequences (caught in v3.5 review). Flags may
-    # include the `--` end-of-options separator. echo may be var-only
-    # (`echo "$TASK"` — 2026-07-08 false-deny class).
-    r'^printf(\s+(--|-[a-zA-Z]+))*\s+\'[^\']*\'(\s+"\$\{?\w+\}?")*$',
-    r'^echo(\s+(--|-[a-zA-Z]+))*(\s+\'[^\']*\')?(\s+"\$\{?\w+\}?")*$',
-    # heredoc write to a tmpfile — marker before OR after the redirect
-    # (`cat <<'EOF' > "$F"` was false-denied 2026-07-07, costing 2 turns).
-    # The literal /tmp target allows nested dirs (this session's scratch is
-    # /tmp/claude-1000/.../scratchpad) but the charset excludes `$(){}` (no
-    # command substitution) and the `(?!\S*\.\.)` lookahead forbids `..`
-    # traversal — the pair that `/tmp/\S+` let through (v3.5 review gb-1).
-    r'^(cat|tee)\s*(<<-?\s*\'?\w+\'?)?\s*>{1,2}\s*("?\$\{?\w+\}?"?|/tmp/(?!\S*\.\.)[A-Za-z0-9._/-]+)\s*(<<-?\s*\'?\w+\'?)?$',
-)]
+#
+# v3.7 (gb-3, 2026-07-09 audit): the runner path must be the segment's COMMAND
+# WORD, not merely present in it — the old `(?:^|[\s;&|(])...` + `.search()`
+# matched the path as a trailing ARGUMENT, so `echo $(cat FILE) <path>` and
+# `foo $(CMD) <path> --footer` ran the substitution and were ALLOWED.
+# Anchor to `^\s*` and reject any command/process substitution ($( ), backtick,
+# <( >( ) or redirection in the segment — the sole permitted substitution is the
+# benign `$(pwd)` (some forwarders inline `--cwd "$(pwd)"`). Plain $VAR/${VAR}
+# expansion is state-bound below: only HOME and task/schema variables declared
+# in this same Bash call are accepted. runner_seg_ok() pairs the two gates.
+MKTEMP = re.compile(r'^mktemp(?:\s+(?P<path>/tmp/(?!\S*\.\.)[A-Za-z0-9._/-]+))?$')
+MKTEMP_ASSIGN = re.compile(
+    r'^(?P<var>[A-Za-z_]\w*)=\$\(mktemp(?:\s+(?P<path>/tmp/(?!\S*\.\.)[A-Za-z0-9._/-]+))?\)$'
+)
+TASK_READ = re.compile(r"^read\s+-r\s+-d\s+''\s+(?P<var>\w+)\s*(?:<<-?\s*'?\w+'?)?$")
+TASK_PRINTF = re.compile(r'^printf(\s+(--|-[a-zA-Z]+))*\s+\'[^\']*\'(\s+"\$\{?\w+\}?")*$')
+TASK_ECHO = re.compile(r'^echo(\s+(--|-[a-zA-Z]+))*(\s+"\$\{?\w+\}?")+$')
+HEREDOC_WRITE = re.compile(
+    r'^(?:cat|tee)\s*(?:<<-?\s*\'?\w+\'?)?\s*>{1,2}\s*'
+    r'(?:"?\$(?:\{(?P<braced>[A-Za-z_]\w*)\}|(?P<plain>[A-Za-z_]\w*))"?'
+    r'|(?P<path>/tmp/(?!\S*\.\.)[A-Za-z0-9._/-]+))\s*'
+    r'(?:<<-?\s*\'?\w+\'?)?$'
+)
 GATE_LOG = os.path.expanduser('~/.claude/hooks/codex-gate.log')
 USAGE_LOG = os.path.expanduser('~/.codex-worker/usage.log')
 
@@ -75,31 +83,48 @@ def log(path, line):
         pass
 
 
-def strip_heredocs(cmd):
-    """Drop heredoc bodies: task text may contain anything, including text
-    that looks like commands or like the runner path — it is data."""
-    lines, out, i = cmd.split('\n'), [], 0
-    while i < len(lines):
-        out.append(lines[i])
-        m = HEREDOC.search(lines[i])
-        i += 1
-        if m:
-            delim = m.group(2)
-            while i < len(lines) and lines[i].strip() != delim:
-                i += 1
-            i += 1  # skip the delimiter line
-    return '\n'.join(out)
+def _schema_tmp_path(path):
+    """Literal tmp paths may hold schema data, never runner scratch controls."""
+    if not path:
+        return True
+    return bool(re.fullmatch(r'(?:schema[A-Za-z0-9._-]*|tmp\.[A-Za-z0-9._-]+)',
+                             os.path.basename(path)))
 
 
 def allowed(cmd):
-    s = strip_heredocs(cmd)
-    s = re.sub(r'\\\n\s*', ' ', s)          # rejoin backslash continuations
-    for seg in re.split(r'[;\n|&]+', s):
-        seg = seg.strip()
-        if RUNNER_CALL.search(seg):
-            continue                         # the one real job (launch or poll)
-        if any(p.match(seg) for p in SEG_OK):
+    task_vars, tmp_vars, runner_count = set(), set(), 0
+    for seg in shell_segments(cmd):
+        if not seg or seg == 'pwd':
             continue
+        if runner_seg_ok(seg):
+            refs = simple_shell_variables(seg)
+            if refs is None or any(v not in ({'HOME'} | tmp_vars) for v in refs):
+                return False
+            runner_count += 1
+            if runner_count > 1:
+                return False                 # contract: invoke exactly once
+            continue
+        m = MKTEMP_ASSIGN.fullmatch(seg)
+        if m and _schema_tmp_path(m.group('path')):
+            tmp_vars.add(m.group('var'))
+            continue
+        m = MKTEMP.fullmatch(seg)
+        if m and _schema_tmp_path(m.group('path')):
+            continue
+        m = TASK_READ.fullmatch(seg)
+        if m:
+            task_vars.add(m.group('var'))
+            continue
+        if TASK_PRINTF.fullmatch(seg) or TASK_ECHO.fullmatch(seg):
+            refs = simple_shell_variables(seg)
+            if refs is not None and all(v in task_vars for v in refs):
+                continue
+            return False
+        m = HEREDOC_WRITE.fullmatch(seg)
+        if m:
+            target_var = m.group('braced') or m.group('plain')
+            if target_var in tmp_vars or (m.group('path') and _schema_tmp_path(m.group('path'))):
+                continue
         return False
     return True
 

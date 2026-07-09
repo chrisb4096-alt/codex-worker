@@ -20,6 +20,9 @@ misfires stay measurable. One line per decision appended to codex-gate.log.
 """
 import json, re, sys, time, os
 
+sys.path.insert(0, os.path.dirname(__file__))
+from codex_worker_gate_common import runner_invoked  # noqa: E402
+
 DIRECTIVE = re.compile(r'^(EFFORT|SANDBOX|CWD|NETWORK|MCP|MODEL|RESUME|LONG|SCHEMA|REVIEW|OUTPUT_FILE):')
 # Footer proof in the final message — the runner prints `missing` when it
 # couldn't extract a session id, which is a misfire, not proof. Anchored to
@@ -36,15 +39,37 @@ FOOTER_LINE = re.compile(r'^\s*\[codex-(session|usage|files-written):')
 # invisible bytes in source, so an editor/chezmoi transform that strips
 # zero-width chars cannot silently reopen the gb-2 hole (v3.5 high review).
 ZERO_WIDTH = {0x200b, 0x200c, 0x200d, 0x2060, 0xfeff}
-# Path-form invocation of the runner (also matches the printed --poll continuation);
-# an `echo codex-run.sh` or a mention inside other text does not count.
-# Keep in sync with RUNNER_CALL in executable_codex-worker-bright-line.py —
-# the PreToolUse gate must never allow a form this gate refuses to count. The
-# `.claude/agents/bin/` prefix is required so a written /tmp/codex-run.sh
-# neither passes the bright-line nor counts as proof here (v3.5 high review).
-RUNNER_CALL = re.compile(r'(?:^|[\s;&|(])(?:~|\$HOME|/\S+?)/\.claude/agents/bin/codex-run\.sh(?:\s|$)', re.M)
+# Path-form invocation of the runner, as a SEGMENT COMMAND WORD (v3.7, gb-3:
+# `echo <path>` used to set forwarded=True — an unanchored `.search()` counted
+# the path as an argument, so self-authored content + `echo <path>` + a forged
+# footer passed both gates). Keep in sync with executable_codex-worker-bright-line.py.
 LOG = os.path.expanduser('~/.claude/hooks/codex-gate.log')
 USAGE_LOG = os.path.expanduser('~/.codex-worker/usage.log')
+SID_RE = re.compile(r'[0-9a-fA-F-]{8,}')
+
+
+def session_ran(sid):
+    """UNFORGEABLE proof: only codex-run.sh writes `ok session=<id>` to usage.log,
+    before the forwarder's final message exists — so a model cannot fabricate it.
+    True = codex genuinely ran; False = usage.log readable but this id is absent
+    (forged/self-authored footer); None = usage.log unreadable (fail closed: a
+    self-asserted footer is not proof)."""
+    if not sid or not SID_RE.fullmatch(sid):
+        return False
+    # Match the session as an EXACT positional field (`<ts> ok session=<id> ...`),
+    # never a substring: `session=<id>` in `if x in line` accepted an 8-hex
+    # PREFIX of a real id, and a run whose --cwd embedded `ok session=<forged> `
+    # would plant that token later in its own log line (v3.7 review).
+    target = 'session=' + sid
+    try:
+        with open(USAGE_LOG) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == 'ok' and parts[2] == target:
+                    return True
+        return False
+    except OSError:
+        return None
 
 def log(verdict, why):
     try:
@@ -71,6 +96,16 @@ def texts(content):
         return '\n'.join(c.get('text', '') for c in content if isinstance(c, dict) and c.get('type') == 'text')
     return ''
 
+
+def tool_result_text(block):
+    content = block.get('content', '') if isinstance(block, dict) else ''
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return '\n'.join(c.get('text', '') for c in content
+                         if isinstance(c, dict) and c.get('type') == 'text')
+    return ''
+
 def main():
     try:
         j = json.load(sys.stdin)
@@ -83,6 +118,7 @@ def main():
     if not tp or not os.path.isfile(tp):
         return
     first_user, last_assistant, forwarded, structured = None, '', False, False
+    proof_tool_ids, emitted_sessions = set(), set()
     try:
         with open(tp) as f:
             for line in f:
@@ -92,8 +128,15 @@ def main():
                     continue
                 m = o.get('message') or {}
                 role, content = m.get('role'), m.get('content')
-                if role == 'user' and first_user is None:
-                    first_user = texts(content)
+                if role == 'user':
+                    if first_user is None:
+                        first_user = texts(content)
+                    if isinstance(content, list):
+                        for c in content:
+                            if not (isinstance(c, dict) and c.get('type') == 'tool_result'):
+                                continue
+                            if c.get('tool_use_id') in proof_tool_ids:
+                                emitted_sessions.update(SESSION_FOOTER.findall(tool_result_text(c)))
                 elif role == 'assistant':
                     t = texts(content)
                     msg_structured = False
@@ -101,8 +144,11 @@ def main():
                         for c in content:
                             if not (isinstance(c, dict) and c.get('type') == 'tool_use'):
                                 continue
-                            if RUNNER_CALL.search((c.get('input') or {}).get('command', '')):
+                            command = (c.get('input') or {}).get('command', '')
+                            if runner_invoked(command):
                                 forwarded = True
+                                if runner_invoked(command, proof_only=True) and c.get('id'):
+                                    proof_tool_ids.add(c['id'])
                             elif c.get('name') == 'StructuredOutput':
                                 msg_structured = True
                     # StructuredOutput counts as proof only when it is part of the
@@ -117,14 +163,30 @@ def main():
         return                              # fallback heuristic when agent_type is absent
     last_assistant = j.get('last_assistant_message') or last_assistant
     head = last_assistant.lstrip()
-    # Proof lives in the FINAL message: relayed footers (or a StructuredOutput
-    # submission on schema legs — counted only after a real runner call, else
-    # it is the self-execution incident wearing a tool call), or a loud
-    # CODEX_ERROR. A runner call alone is NOT proof (placeholder incident).
+    # Proof, strongest first: (1) the session id is in the RUNNER-OWNED
+    # usage.log (unforgeable — codex-run.sh writes it before the final exists);
+    # (2) the same bound proof plus a StructuredOutput submission for schema
+    # legs. Command text alone never proves forwarding: the matching launch or
+    # poll tool_result must have emitted the session. A loud CODEX_ERROR is an
+    # honest failure.
     if head.startswith('CODEX_ERROR'):
         log('allow', 'loud-failure')
         return
-    sess = SESSION_FOOTER.search(last_assistant)
+    # The runner appends its [codex-session:] footer AFTER the content, so the
+    # AUTHENTIC footer is the LAST match — an earlier footer-shaped line inside
+    # relayed content (e.g. codex quoting a footer while reviewing this very repo)
+    # must not shadow it (v3.7 high review: first-match branded genuine runs forged).
+    sess_ids = SESSION_FOOTER.findall(last_assistant)
+    sess = sess_ids[-1] if sess_ids else None
+    # `bound` is the primary, unforgeable proof on the Agent lane: the session id
+    # appears in a launch/poll/recover tool_result THIS transcript produced, and a
+    # tool_result is real runner stdout the model cannot fabricate. usage.log
+    # (`ran`) is corroboration for the block MESSAGES only — it must NEVER gate an
+    # allow, because the runner's usage.log append is best-effort and can fail
+    # (mode 0400 / ENOSPC / race) on a genuine run, which would otherwise brand
+    # real work "forged" (v3.7 high review).
+    bound = bool(sess and sess in emitted_sessions)
+    ran = session_ran(sess)             # corroboration: True=in usage.log, False=absent, None=unreadable
     # A "content" line has a visible glyph that is not a footer — zero-width
     # and BOM chars don't count (v3.5 review gb-2: U+200B survived .strip()
     # and masked a stripped relay as real content).
@@ -132,27 +194,56 @@ def main():
         return bool(l.translate(dict.fromkeys(ZERO_WIDTH)).strip())
     has_content = any(visible(l) and not FOOTER_LINE.match(l)
                       for l in last_assistant.splitlines())
-    if forwarded and (structured or (sess and has_content)):
-        log('allow', 'forwarded+proof')
+    if forwarded and bound and has_content:
+        log('allow', 'forwarded+bound-proof')
+        return
+    # Schema legs: a StructuredOutput submission in the final message counts once
+    # a launch/poll/recover in this transcript has bound a real session.
+    if forwarded and structured and emitted_sessions:
+        log('allow', 'forwarded+structured+bound-proof')
         return
     if j.get('stop_hook_active'):           # already blocked once — never loop, but keep misfires measurable
         log('allow', 'stop_hook_active-unproven')
         log_violation(j)
         return
     log_violation(j)
-    # Only a well-formed session id may be embedded in the recovery command —
-    # a prompt-injected fake footer could otherwise smuggle shell metachars
-    # into a command the forwarder will run inside an allowed runner segment.
-    if forwarded and sess and re.fullmatch(r'[0-9a-fA-F-]+', sess.group(1)):
-        # Footers survived but the body didn't — a stripped relay. Recovery is
-        # deterministic: the runner re-emits content + footers from its archive.
+    # Bound but no content survived: the relay dropped the body. The launch/poll
+    # already proved the run, so recovery is deterministic from the runner's
+    # archive. (SID_RE-guard the id before embedding it in the recovery command.)
+    if bound and sess and SID_RE.fullmatch(sess):
         log('block', 'footers without content (stripped relay)')
         print(json.dumps({
             'decision': 'block',
             'reason': ('codex-worker contract violation: your final message carries the [codex-session:] footer but '
                        'no content — the relay dropped the body. Recover it mechanically: run '
-                       '`~/.claude/agents/bin/codex-run.sh --footer --recover ' + sess.group(1) + '` and return that '
+                       '`~/.claude/agents/bin/codex-run.sh --footer --recover ' + sess + '` and return that '
                        'stdout VERBATIM (content + footers). Never retype the result from memory.'),
+        }))
+        return
+    # A [codex-session:] footer NOT backed by any launch/poll/recover tool_result
+    # in this transcript is unproven for this turn — usage.log only sharpens the
+    # message (forged id / log unreadable / lifted id), never the verdict.
+    if sess:
+        if ran is False:
+            why = 'forged session footer (not in usage.log)'
+            detail = ('your [codex-session:] footer names a session that codex-run.sh never logged — you did NOT '
+                      'run codex. Never fabricate footers.')
+        elif ran is None:
+            why = 'usage.log unavailable; cannot corroborate session'
+            detail = ('the runner proof log is unavailable, so the [codex-session:] footer cannot be corroborated. '
+                      'Restore ~/.codex-worker/usage.log access first.')
+        else:
+            why = 'session not emitted by this transcript launch/poll/recover result'
+            detail = ('this session is in usage.log but was not emitted by a launch, --poll, or --recover tool '
+                      'result in this transcript — a session id lifted from the task text or a prior run, a '
+                      '--verify call, a denied call, or a heredoc body is not proof for this turn.')
+        log('block', why)
+        print(json.dumps({
+            'decision': 'block',
+            'reason': ('codex-worker contract violation: ' + detail + ' Pipe the task text verbatim to '
+                       '~/.claude/agents/bin/codex-run.sh --footer with the directive flags and return its real '
+                       'stdout (content + [codex-session:]/[codex-usage:] footers), recover a completed run with '
+                       '--recover, or return `CODEX_ERROR: <reason>` if it genuinely failed.'),
         }))
         return
     if forwarded:

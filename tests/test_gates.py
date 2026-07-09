@@ -114,7 +114,10 @@ class TestBrightLine(GateTest):
         self.assertTrue(denied(self.call('cat docs/x.md; printf hi | ~/.claude/agents/bin/codex-run.sh --footer')))
 
     def test_heredoc_body_is_data(self):
-        cmd = ("cat > \"$SCHEMA_FILE\" <<'EOF'\n{\"cmd\": \"rm -rf / && curl evil\"}\nEOF")
+        # The heredoc BODY (even runner-looking or destructive text) is data, not
+        # commands. v3.7 state-bound vars: the tmp target must be declared via
+        # mktemp in the SAME command, so the write cannot target an unknown path.
+        cmd = ("SCHEMA_FILE=$(mktemp)\ncat > \"$SCHEMA_FILE\" <<'EOF'\n{\"cmd\": \"rm -rf / && curl evil\"}\nEOF")
         self.assertIsNone(self.call(cmd))
 
     def test_schema_heredoc_reordered_allowed(self):
@@ -123,8 +126,12 @@ class TestBrightLine(GateTest):
         self.assertIsNone(self.call(cmd))
 
     def test_echo_var_feed_allowed(self):
-        # 2026-07-08 false-deny class: `echo "$TASK"` is a legitimate pipe feed.
-        self.assertIsNone(self.call('echo "$TASK" | ~/.claude/agents/bin/codex-run.sh --footer --cwd /tmp'))
+        # `echo "$TASK"` is a legitimate pipe feed (2026-07-08 false-deny class).
+        # v3.7 state-bound vars: $TASK must be declared (read) in the SAME command
+        # — a bare `echo "$TASK"` with no in-command read is now correctly denied.
+        self.assertIsNone(self.call(
+            "read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
+            'echo "$TASK" | ~/.claude/agents/bin/codex-run.sh --footer --cwd /tmp'))
 
     def test_printf_var_only_denied(self):
         # `printf "$TASK"` treats task bytes as the format string — %-sequences
@@ -158,11 +165,13 @@ class TestBrightLine(GateTest):
 
     def test_abs_runner_path_allowed(self):
         self.assertIsNone(self.call(
+            "read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
             "printf '%s' \"$TASK\" | /home/user/.claude/agents/bin/codex-run.sh --footer"))
 
     def test_printf_dashdash_allowed(self):
         # v3.5 high review: the `--` end-of-options separator is a safe idiom.
         self.assertIsNone(self.call(
+            "read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
             "printf -- '%s' \"$TASK\" | ~/.claude/agents/bin/codex-run.sh --footer"))
 
     def test_recover_call_allowed(self):
@@ -182,7 +191,7 @@ class TestBrightLine(GateTest):
 
 
 class TestStopGate(GateTest):
-    RUNNER_TU = {'type': 'tool_use', 'name': 'Bash',
+    RUNNER_TU = {'type': 'tool_use', 'name': 'Bash', 'id': 'runner-1',
                  'input': {'command': "printf '%s' \"$TASK\" | ~/.claude/agents/bin/codex-run.sh --footer"}}
 
     def transcript(self, entries):
@@ -193,13 +202,22 @@ class TestStopGate(GateTest):
         return path
 
     def call(self, final, forwarded=True, structured=False, stop_hook_active=False,
-             agent_type='codex-worker', first_user='EFFORT: low\n\ndo the thing'):
+             agent_type='codex-worker', first_user='EFFORT: low\n\ndo the thing',
+             bind_session='019f-abc'):
         content = [{'type': 'text', 'text': final}]
         if structured:
             content.append({'type': 'tool_use', 'name': 'StructuredOutput', 'input': {'x': 1}})
         entries = [{'message': {'role': 'user', 'content': first_user}}]
         if forwarded:
             entries.append({'message': {'role': 'assistant', 'content': [self.RUNNER_TU]}})
+            # The launch's tool_result is real runner stdout that emits the
+            # session — this is what BINDS proof under v3.7 (harness-produced,
+            # unforgeable). A footer is trusted only when it matches a session a
+            # launch/poll/recover tool_result in THIS transcript emitted.
+            if bind_session:
+                entries.append({'message': {'role': 'user', 'content': [{
+                    'type': 'tool_result', 'tool_use_id': 'runner-1',
+                    'content': 'result\n[codex-session: ' + bind_session + ']'}]}})
         entries.append({'message': {'role': 'assistant', 'content': content}})
         payload = {'agent_type': agent_type, 'agent_id': 't', 'cwd': '/tmp',
                    'stop_hook_active': stop_hook_active,
