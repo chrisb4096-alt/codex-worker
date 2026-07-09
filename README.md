@@ -1,6 +1,6 @@
 # codex-worker
 
-Run Claude Code's multi-agent workflows on OpenAI Codex (GPT-5.5) workers. Claude stays the orchestrator — planning, fan-out, adjudication — while every subagent leg executes on your Codex subscription instead of your Claude one.
+Run Claude Code's multi-agent workflows on OpenAI Codex (GPT-5.6-sol) workers. Claude stays the orchestrator — planning, fan-out, adjudication — while every subagent leg executes on your Codex subscription instead of your Claude one.
 
 The result, measured on real workloads: a comparable multi-agent code review costs roughly **$1.28 of Claude-side API-equivalent tokens instead of $117** (details and caveats in [Token economics](#token-economics)).
 
@@ -24,7 +24,7 @@ Claude Code (orchestrator, your best Claude model)
   └─ Workflow / Agent tool spawns agentType: 'codex-worker'
        └─ thin forwarder subagent (haiku-class — the ONLY Claude tokens a leg costs)
             └─ Bash: task text | codex-run.sh --footer --effort high ...
-                 └─ detached `codex exec` (GPT-5.5) does the actual work
+                 └─ detached `codex exec` (GPT-5.6-sol) does the actual work
             ←─ stdout relayed VERBATIM + [codex-session:] [codex-usage:] footers
 ```
 
@@ -51,7 +51,7 @@ The gates fail open on malformed input — they must never block valid work — 
 
 A codex-worker task is plain text, optionally opened by directive lines:
 
-- `EFFORT: low|medium|high|xhigh` — Codex reasoning effort per role (low for extraction/lint, high for synthesis/adversarial verification)
+- `EFFORT: none|low|medium|high|xhigh|max|ultra` — Codex reasoning effort per role (default high; xhigh for synthesis/debug/adversarial verification; ultra = codex-native multi-agent orchestration inside one leg; low/none for extraction/lint)
 - `SANDBOX: read-only|workspace-write` — filesystem access for the Codex run (default read-only)
 - `CWD: /abs/path` — repo the task operates on
 - `NETWORK: on` — allow network access (web research legs)

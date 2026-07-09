@@ -75,7 +75,7 @@ const finders = DIMS.map(d => () =>
     'Cap at 12 findings (keep the most severe); minified JSON, total output under 8KB.',
     'Output ONLY a single minified JSON object on one line, no fences, no prose:',
     '{"findings":[{"id":"' + d.key + '-1","file":"path","line":0,"summary":"...","failure_scenario":"concrete input/state -> wrong outcome"}]}',
-  ].filter(Boolean).join('\n'), { label: 'gpt-5.5:find:' + d.key, phase: 'Find' })
+  ].filter(Boolean).join('\n'), { label: 'sol:find:' + d.key, phase: 'Find' })
 )
 // Independent perspective: codex's native review harness (self-gathers its
 // own diff, returns structured findings). OPT-IN via args.review_target: no
@@ -83,9 +83,9 @@ const finders = DIMS.map(d => () =>
 // unstaged/untracked work, which leaks out-of-scope findings into confirmed[].
 const nativeTarget = args.review_target || null
 if (nativeTarget) finders.push(async () => {
-  const p = lint(['EFFORT: medium', 'CWD: ' + args.cwd, 'REVIEW: ' + nativeTarget].join('\n'))
-  let v = parseCodex(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:find:native-review', phase: 'Find' }))
-  if (!v) v = parseCodex(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:find:native-review:retry', phase: 'Find' }))
+  const p = lint(['EFFORT: high', 'CWD: ' + args.cwd, 'REVIEW: ' + nativeTarget].join('\n'))
+  let v = parseCodex(await dispatch(p, { agentType: 'codex-worker', label: 'sol:find:native-review', phase: 'Find' }))
+  if (!v) v = parseCodex(await dispatch(p, { agentType: 'codex-worker', label: 'sol:find:native-review:retry', phase: 'Find' }))
   if (v && v.codex_file) return v   // oversized: let the shared handler surface the file
   if (!v || !Array.isArray(v.findings)) return null
   return { findings: v.findings.map((f, i) => ({ ...normalizeFinding(f), id: 'native-' + (i + 1) })) }
@@ -125,13 +125,13 @@ if (!found.length) return { confirmed: [], refuted: [], oversized_finder_files: 
 
 phase('Verify')
 const verdicts = await parallel(found.map(f => () =>
-  leg('high', [
+  leg('xhigh', [
     'Adversarially VERIFY this review finding — your default stance is that it is WRONG; confirm only if evidence forces you to.',
     'Finding: ' + JSON.stringify(f),
     'You MUST run commands (rg call sites, read the exact lines, run a test or a snippet where cheap) and report them as evidence. A verdict without commands_run is invalid.',
     'Output ONLY a single minified JSON object on one line, no fences, no prose:',
     '{"id":"' + f.id + '","verdict":"confirmed|refuted","reason":"...","commands_run":[{"cmd":"...","observed":"key output line"}]}',
-  ].join('\n'), { label: 'gpt-5.5:verify:' + f.id, phase: 'Verify' })
+  ].join('\n'), { label: 'sol:verify:' + f.id, phase: 'Verify' })
     .then(v => ({ finding: f, v }))
 ))
 const judged = verdicts.filter(Boolean).map(({ finding, v }) => (

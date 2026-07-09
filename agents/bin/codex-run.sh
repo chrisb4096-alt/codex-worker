@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# codex-run.sh — deterministic runner for the codex-worker contract (v3.5).
+# codex-run.sh — deterministic runner for the codex-worker contract (v3.6).
+# v3.6 (2026-07-09): default model gpt-5.5 -> gpt-5.6-sol; default effort
+# medium -> high; effort enum extended to none|low|medium|high|xhigh|max|ultra
+# (all live-verified on codex 0.144.0; ultra = codex-native multi-agent
+# orchestration, ~4 parallel agents).
 # Launch mode: reads the task text on stdin, launches codex detached, polls.
 # Poll mode (--poll <scratch>): resumes polling a still-running launch.
 # Recover mode (--recover <session-id>): re-emit a completed run's content +
@@ -20,7 +24,7 @@
 set -u
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-MODEL=gpt-5.5 EFFORT=medium SANDBOX=workspace-write CWD="$PWD"
+MODEL=gpt-5.6-sol EFFORT=high SANDBOX=workspace-write CWD="$PWD"
 NETWORK=0 MCP="" SCHEMA="" SCHEMA_FILE="" RESUME="" RETRY_SAFE=0
 POLL="" BUDGET=540 FOOTER=0 REVIEW="" EXTRACT="" OUTPUT_FILE="" RECOVER=""
 WORKER_HOME="$HOME/.codex-worker"
@@ -154,7 +158,7 @@ if [ -z "$POLL" ]; then
       echo "CODEX_ERROR: directive value contains shell metacharacters: $v" >&2; exit 2 ;;
     esac
   done
-  case "$EFFORT" in low|medium|high|xhigh) : ;; *) echo "CODEX_ERROR: invalid --effort '$EFFORT'" >&2; exit 2 ;; esac
+  case "$EFFORT" in none|low|medium|high|xhigh|max|ultra) : ;; *) echo "CODEX_ERROR: invalid --effort '$EFFORT'" >&2; exit 2 ;; esac
   case "$SANDBOX" in read-only|workspace-write) : ;; *) echo "CODEX_ERROR: invalid --sandbox '$SANDBOX'" >&2; exit 2 ;; esac
   if [ -n "$REVIEW" ]; then
     case "$REVIEW" in

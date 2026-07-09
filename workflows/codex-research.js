@@ -69,12 +69,12 @@ const angles = (args.angles && args.angles.length) ? args.angles : [
 
 phase('Gather')
 const reports = (await parallel(angles.map((a, i) => () =>
-  leg('medium', [
+  leg('high', [
     'Research question: ' + args.question,
     'Your angle (report ONLY through this lens): ' + a,
     'Investigate the repo/files under this directory thoroughly (rg, read files, git log as needed).',
     'Return a dense factual report (<=60 lines): findings with file:line references, direct quotes where load-bearing, and an explicit "could not determine" list. No speculation presented as fact.',
-  ].join('\n'), { label: 'gpt-5.5:gather:' + i, phase: 'Gather' })
+  ].join('\n'), { label: 'sol:gather:' + i, phase: 'Gather' })
 ))).filter(Boolean)
 log(reports.length + '/' + angles.length + ' angle reports gathered')
 if (!reports.length) return { error: 'all gather legs failed', paused_by_cap: capPause, usage: usedTokens }
@@ -87,16 +87,16 @@ const synthesis = await leg('xhigh', [
   'The independent angle reports are in these files — read each one with your shell (`cat <path>`, ~ expands; if one is missing, say so rather than guessing). Trust their file:line evidence, reconcile conflicts explicitly:',
   ...reports.map((r, i) => 'REPORT ' + i + ': ' + r.file),
   'Return: the answer, key evidence (file:line), open uncertainties, and what would resolve them. <=80 lines.',
-].join('\n'), { label: 'gpt-5.5:synthesize', phase: 'Synthesize' })
+].join('\n'), { label: 'sol:synthesize', phase: 'Synthesize' })
 if (!synthesis) {
   log('synthesis leg failed twice — returning raw angle reports')
   return { error: 'synthesis leg failed', angle_reports: reports, paused_by_cap: capPause, usage: usedTokens }
 }
-const critique = await leg('high', [
+const critique = await leg('xhigh', [
   'Completeness critic. Question: ' + args.question,
   'The proposed synthesis is in the file ' + synthesis.file + ' — read it with your shell (`cat <path>`, ~ expands).',
   'What is missing, unverified, or assumed? Check the repo directly for the 2-3 most load-bearing claims. Return: verified claims (with command+output), gaps worth a follow-up, verdict solid|needs-work. <=30 lines.',
-].join('\n'), { label: 'gpt-5.5:critique', phase: 'Synthesize' })
+].join('\n'), { label: 'sol:critique', phase: 'Synthesize' })
 log('codex spend this run: input=' + usedTokens.input + ' output=' + usedTokens.output + ' (NOT in harness budget)')
 if (capPause) log('PAUSED BY CAP: ' + capPause.paused_by + ' — ' + capPause.blocked + ' dispatches blocked after ' + capPause.agents_dispatched + ' agents / ' + capPause.codex_tokens_spent + ' codex tokens')
 return {

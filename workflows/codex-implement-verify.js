@@ -1,7 +1,7 @@
 export const meta = {
   name: 'codex-implement-verify',
   description: 'Codex implementation legs, each mechanically post-verified (call sites, test deltas, live path)',
-  whenToUse: 'Fan-out implementation with anti-rubber-stamp verification. args: {tasks: [{id, cwd: "/abs", spec, effort?: "medium"|"high", test_cmd?}]}',
+  whenToUse: 'Fan-out implementation with anti-rubber-stamp verification. args: {tasks: [{id, cwd: "/abs", spec, effort?: "high"|"xhigh", test_cmd?}]}',
   phases: [
     { title: 'Pin', detail: 'spark pins pre-run git state per task' },
     { title: 'Implement', detail: 'workspace-write codex writers (no commit/push)' },
@@ -77,7 +77,7 @@ const results = await pipeline(
   // Implement: workspace-write, real writer effort
   async (pinned, t) => {
     const p = lint([
-      'EFFORT: ' + (t.effort || 'medium'),
+      'EFFORT: ' + (t.effort || 'high'),
       'SANDBOX: workspace-write',
       'CWD: ' + t.cwd,
       '',
@@ -88,7 +88,7 @@ const results = await pipeline(
       (t.test_cmd ? 'full output summary line of `' + t.test_cmd + '`, ' : '') +
       'and any deviation from the spec with why.',
     ].join('\n'))
-    const r = gate(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:impl:' + t.id, phase: 'Implement' }))
+    const r = gate(await dispatch(p, { agentType: 'codex-worker', label: 'sol:impl:' + t.id, phase: 'Implement' }))
     const files = r && (r.match(/^\[codex-files-written: (\d+)\]/m) || [])[1]
     return { task: t, pin: pinned.pin, report: r, files_written: files ? +files : null }
   },
@@ -97,7 +97,7 @@ const results = await pipeline(
     if (!impl.report) return { ...impl, verify: { verdict: 'writer-failed', reason: 'no codex session — leg failed or was absorbed' } }
     if (impl.files_written === 0) return { ...impl, verify: { verdict: 'no-op', reason: 'FILES_WRITTEN: 0 — nothing changed on disk' } }
     const p = lint([
-      'EFFORT: high',
+      'EFFORT: xhigh',
       'SANDBOX: read-only',
       'CWD: ' + t.cwd,
       '',
@@ -110,8 +110,8 @@ const results = await pipeline(
       'Output ONLY a single minified JSON object on one line, no fences, no prose:',
       '{"verdict":"pass|fail","defects":[{"summary":"...","evidence":"cmd + output"}],"commands_run":[{"cmd":"...","observed":"..."}]}',
     ].filter(Boolean).join('\n'))
-    let v = jsonOf(gate(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:verify:' + t.id, phase: 'Post-verify' })) || '')
-    if (!v) v = jsonOf(gate(await dispatch(p, { agentType: 'codex-worker', label: 'gpt-5.5:verify:' + t.id + ':retry', phase: 'Post-verify' })) || '')
+    let v = jsonOf(gate(await dispatch(p, { agentType: 'codex-worker', label: 'sol:verify:' + t.id, phase: 'Post-verify' })) || '')
+    if (!v) v = jsonOf(gate(await dispatch(p, { agentType: 'codex-worker', label: 'sol:verify:' + t.id + ':retry', phase: 'Post-verify' })) || '')
     if (v && v.codex_file) v = { verdict: 'oversized-output', codex_file: v.codex_file, defects: [], commands_run: [] }
     else if (v && (!Array.isArray(v.commands_run) || !v.commands_run.length)) v = { verdict: 'invalid-no-evidence', defects: [], commands_run: [] }
     return { ...impl, verify: v || { verdict: 'verifier-failed', reason: 'no parseable verdict after retry' } }
