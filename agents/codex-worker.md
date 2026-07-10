@@ -193,6 +193,17 @@ runner's archive.
   A result WITHOUT it means codex never ran — the forwarder did the task itself
   (observed 16/16 in one audited fleet). Treat as a failed leg: discard and
   retry; never accept the content.
+- WORKFLOW DISPATCH MUST PASS agentType: every `agent()` call in a codex
+  Workflow script needs `{agentType: 'codex-worker'}` — omit it and the leg runs
+  as a plain workflow-subagent on the SESSION model (often fable) with full
+  tools: it does the task itself at flagship prices and codex never runs.
+  Failure signature (2026-07-09 incident: 5 legs + 5 in-script retries, ~737k
+  fable tokens): EVERY leg fails the no-session-footer gate while returning
+  plausible content, `~/.codex-worker/usage.log` gains zero lines in the
+  window, and the run's `agent-*.meta.json` shows `"agentType":
+  "workflow-subagent"`. That is a DISPATCH bug — retry-with-variation cannot
+  fix it. Grep the script for `agent(` before launch; on an all-legs-footerless
+  fan-out, check meta.json BEFORE re-dispatching anything.
 - TWO ENFORCEMENT LANES — know which one you are on:
   - ONLY main-loop `Agent(subagent_type: 'codex-worker')` legs fire the
     `settings.json` hooks: the PreToolUse bright-line gate denies any non-runner
@@ -242,6 +253,10 @@ runner's archive.
   `agent()` without the schema option, and parse in the script:
 
   ```js
+  // Route EVERY dispatch through this wrapper so the codex lane can't be
+  // dropped on one call (see WORKFLOW DISPATCH MUST PASS agentType above).
+  const codexAgent = (prompt, opts = {}) => agent(prompt, { agentType: 'codex-worker', ...opts })
+
   const parseCodex = (r) => {
     if (!r || typeof r !== 'string') return null
     if (r.trimStart().startsWith('CODEX_ERROR')) return null       // runner/worker failure
@@ -298,7 +313,10 @@ runner's archive.
   means recovery, not a re-run.
 - RETRY WITH VARIATION, NEVER REPETITION: a leg that fails parse/proof twice
   on the same prompt will fail a third time — the failure is deterministic in
-  the prompt shape (both 2026-07-07 double-failures were). Change the shape:
+  the prompt shape (both 2026-07-07 double-failures were). Exception: when
+  EVERY leg of a fan-out fails no-session-footer at once, the defect is the
+  dispatch lane (missing agentType / wrong subagent_type), not any prompt —
+  stop and fix the dispatch instead of retrying anything. Change the shape:
   add `OUTPUT_FILE:` to force file-relay, move embedded data to a file, or
   escalate to the orchestrator. Before ANY re-run, check
   `~/.codex-worker/usage.log` — a status=ok line means codex succeeded and the
@@ -324,6 +342,12 @@ runner's archive.
   cheapest reliable verification yourself. Task text must state: do NOT
   commit, push, deploy, or edit config outside the workspace. Report what
   codex changed vs what you verified vs remaining risk — three separate lists.
+  `[codex-files-written:]` is an mtime scan of the whole CWD since leg start:
+  CONCURRENT legs sharing a worktree each report the union of everyone's
+  writes (live 2026-07-09: three parallel legs, identical count each), and
+  codex's JSON telemetry can't do better — shell-command writes emit no
+  file_change items (verified 0.144.0). Treat the count as advisory; the
+  `git status` reconciliation above is the only per-fan-out truth.
 - LABELS: the harness UI shows the wrapper's Claude model (haiku), so the
   label is the only visible truth about the real worker. Prefix every
   codex-worker `agent()`/Agent call label with the actual model:
