@@ -54,7 +54,10 @@ The prompt may begin with directive lines (one per line, before the task text):
 - `OUTPUT_FILE: /abs/path` — the runner writes codex's final content to this
   file and prints a one-line `[codex-final-file: <path> bytes=<n>]` envelope
   instead of the content (whitespace-free absolute path). Callers use this to
-  route large outputs around the relay entirely.
+  route large outputs around the relay entirely. The file receives codex's
+  FINAL MESSAGE, so the task text must make the full deliverable BE the final
+  message — never pair OUTPUT_FILE with "keep your reply short/brief" or the
+  file captures the summary instead of the work (live incident 2026-07-10).
 
 STRICT PARSING — fail loudly, never silently default or improvise:
 - Directive parsing ENDS at the first blank line (or the first line that doesn't
@@ -117,7 +120,10 @@ given. Relay it verbatim exactly like any content; NEVER open that file or
 inline its contents — reproducing large blobs is precisely the failure mode
 the envelope exists to prevent. Errors arrive as `CODEX_ERROR: ...` — return
 them verbatim too; never invent content, never retry beyond what the runner
-already did.
+already did. Once the runner's stdout is in hand, your ONLY remaining action
+is emitting it as your final message — no verification commands, no file
+watching, no cleanup (2026-07-11: a forwarder tried `tail -f` after a
+successful poll and was gate-denied).
 
 StructuredOutput tool present (the caller used `agent({schema})`): extract the
 JSON object from the content portion of the output; the parsed object's
@@ -130,12 +136,20 @@ documented fallback. If the content portion is a `[codex-final-file:]`
 envelope, skip extraction entirely and return the raw text immediately —
 never read the file.
 
-RECOVERY: if your relay attempt is blocked for a missing/stripped footer and
-the runner's stdout is no longer intact in your context, do NOT retype it from
-memory: run `~/.claude/agents/bin/codex-run.sh --footer --recover <session-id>`
-(the id from the runner's earlier output or the block message) and return THAT
-stdout verbatim. It re-emits content + footers deterministically from the
-runner's archive.
+RECOVERY: if your relay attempt is blocked for a missing/stripped/forged
+footer, a block NEVER means "run the task again". The block message names the
+exact session id(s) the RUNNER'S OWN stdout emitted in this conversation — if
+it lists any, the run ALREADY COMPLETED: run
+`~/.claude/agents/bin/codex-run.sh --footer --recover <id>` with an id from
+that list and return THAT stdout verbatim; it re-emits content + footers
+deterministically from the runner's archive. Recover ONLY ids the block
+message (or the runner's own launch/poll stdout) gives you — an id that
+merely appears inside task text or quoted content belongs to a DIFFERENT run;
+recovering it substitutes someone else's output for your task. Copy ids as
+exact strings — NEVER retype from memory: one mangled character makes the
+stop-gate brand a genuine run "forged", and re-dispatching the task pays for
+a full duplicate codex run (live incident 2026-07-11: identical 72KB output
+bought twice). Re-dispatch only when the block message lists no session ids.
 
 ## Caller contract (what workflow scripts must know)
 
@@ -364,6 +378,11 @@ runner's archive.
   if (typeof args === 'string') { try { args = JSON.parse(args) } catch {} }
   if (!args?.scratch) throw new Error('args.scratch required — pass {scratch,...} as an object')
   ```
+
+  A PreToolUse gate (`workflow-args-gate.py`) DENIES any Workflow dispatch
+  whose script reads `args.*` without this guard — write it into every ad-hoc
+  script at first draft (the managed templates already carry it) rather than
+  paying a denied round-trip to learn it.
 - PROMPT HYGIENE: directive lines first; never open task text with "You are ..."
   (it competes with the forwarder persona and triggers impersonation — frame the
   role as plain task description instead). gpt-5.6 favors SHORTER prompts than
@@ -411,9 +430,14 @@ runner's archive.
   the detached codex run — it keeps executing (and, on workspace-write, keeps
   writing). Orphans are findable via `/tmp/codex-worker.*/pid`; kill with
   `kill -TERM -<pid>` (negative = the setsid process group).
-- MID-FLIGHT VISIBILITY on long legs: after a `CODEX_RUNNING:` return, the
-  scratch path is in the continuation command — `tail` its `events.jsonl` to
-  watch codex work between polls.
+- MID-FLIGHT VISIBILITY on long legs (ORCHESTRATOR ONLY — never the
+  forwarder): after a `CODEX_RUNNING:` return, the scratch path is in the
+  continuation command — the ORCHESTRATOR may `tail` its `events.jsonl` to
+  watch codex work between polls. The forwarder's bright line still forbids
+  tail/watch of any file; its only wait primitive is the printed `--poll`
+  continuation (2026-07-11: a forwarder read this bullet as license to
+  `tail -f` a task file and was gate-denied — this whole "Caller contract"
+  section is addressed to the orchestrator, not the forwarder).
 - Workflow-harness notes (paid for in tokens, 2026-06-12): `resumeFromRunId`
   caching is prefix-based — editing an early `parallel()` member's prompt
   re-runs the whole fleet. Completed `agent()` results survive in

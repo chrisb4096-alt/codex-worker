@@ -93,6 +93,20 @@ Use a workflow: run codex-review with args {cwd: "/abs/path/to/repo", scope: "st
 
 or spawn a single leg with the Agent tool using `subagent_type: codex-worker`.
 
+## Staying in sync
+
+The contract, runner, hooks, and templates evolve as the upstream system is used (every defect or friction point found in real fan-outs feeds back into them). To keep an installation current:
+
+```bash
+cd codex-worker
+./install.sh --check     # drift report: OK / DRIFT / MISSING per managed file (exit 2 on drift)
+git pull && ./install.sh # update to the latest reviewed state
+```
+
+`--check` compares your installed `~/.claude` copies byte-for-byte against the repo, so any agent (Claude Code, a cron job, another orchestrator) can verify or restore parity mechanically. If you want unattended updates, gate them explicitly on a successful pull — `if git pull --ff-only; then ./install.sh; fi` — but the recommended loop is: scheduled `--check` to *detect* drift, human-or-agent review of `git log -p ..origin/main`, then `./install.sh` to adopt.
+
+Provenance, for the cautious (recommended reading before piping anything into your agent config): this repo is published by an automated pipeline that only pushes after a gate passes — secret scan (gitleaks), personal-data/path scan, the 51-case hook test suite, and an adversarial LLM security review of the exact diff (the contract file is a subagent system prompt, so it is reviewed as prompt-injection surface, not just as docs). Each sync commit message carries the receipt: upstream source commit, scan results, and the review session id. `.source-commit` records the upstream commit the tree mirrors; `MANIFEST.sha256` lists the digest of every managed file. None of that replaces your own review — read the diff before updating, like anything else you install into an agent's trust boundary.
+
 ## Token economics
 
 The pitch is simple: a multi-agent workflow's cost is dominated by its subagent legs, and this stack moves those legs off your Claude subscription entirely. The Claude-side cost of a codex leg is one haiku-class forwarder that reads a short prompt and relays a result.

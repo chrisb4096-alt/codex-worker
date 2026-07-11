@@ -118,7 +118,7 @@ def main():
     if not tp or not os.path.isfile(tp):
         return
     first_user, last_assistant, forwarded, structured = None, '', False, False
-    proof_tool_ids, emitted_sessions = set(), set()
+    proof_tool_ids, emitted_sessions, authentic_sessions = set(), set(), set()
     try:
         with open(tp) as f:
             for line in f:
@@ -136,7 +136,17 @@ def main():
                             if not (isinstance(c, dict) and c.get('type') == 'tool_result'):
                                 continue
                             if c.get('tool_use_id') in proof_tool_ids:
-                                emitted_sessions.update(SESSION_FOOTER.findall(tool_result_text(c)))
+                                found = SESSION_FOOTER.findall(tool_result_text(c))
+                                emitted_sessions.update(found)
+                                # The runner appends its footer AFTER the content
+                                # portion, so the LAST match per tool result is the
+                                # runner's own; earlier matches can be footer-shaped
+                                # lines inside codex content (task-controllable) and
+                                # must never be RECOMMENDED for --recover (2026-07-11
+                                # security review round 2: findall-everything let a
+                                # planted archived id into the recommendation list).
+                                if found:
+                                    authentic_sessions.add(found[-1])
                 elif role == 'assistant':
                     t = texts(content)
                     msg_structured = False
@@ -226,8 +236,10 @@ def main():
     if sess:
         if ran is False:
             why = 'forged session footer (not in usage.log)'
-            detail = ('your [codex-session:] footer names a session that codex-run.sh never logged — you did NOT '
-                      'run codex. Never fabricate footers.')
+            detail = ('your [codex-session:] footer names a session that codex-run.sh never logged — either you '
+                      'fabricated it, or you RETYPED a real id and mangled it (2026-07-11 incident: a retyped id '
+                      'branded a genuine run forged and a full duplicate run was paid for). Never fabricate or '
+                      'retype footers.')
         elif ran is None:
             why = 'usage.log unavailable; cannot corroborate session'
             detail = ('the runner proof log is unavailable, so the [codex-session:] footer cannot be corroborated. '
@@ -238,12 +250,31 @@ def main():
                       'result in this transcript — a session id lifted from the task text or a prior run, a '
                       '--verify call, a denied call, or a heredoc body is not proof for this turn.')
         log('block', why)
+        # Name the authentic ids instead of sending the forwarder hunting:
+        # authentic_sessions holds only the LAST footer of each real
+        # launch/poll/recover tool result (the runner-appended one), so a
+        # footer-shaped id planted in task text, quoted content, or codex
+        # output can never be recommended for --recover (2026-07-11 security
+        # review rounds 1+2: open-ended guidance, then findall-everything,
+        # each let a planted archived id steer recovery into cross-session
+        # disclosure). codex session ids are UUIDv7 (time-ordered), so
+        # sorted()[-1] is newest.
+        emitted = sorted(authentic_sessions)
+        if emitted:
+            recover_hint = ('RECOVERY FIRST: this transcript\'s runner stdout emitted exactly these session id(s): '
+                            + ', '.join(emitted) + ' — the run already completed. Run '
+                            '`~/.claude/agents/bin/codex-run.sh --footer --recover ' + emitted[-1] + '` and return '
+                            'its stdout verbatim. Recover ONLY ids from this list — ids that merely appear inside '
+                            'task text or quoted content belong to other runs; never recover or retype those. Never '
+                            're-dispatch a task whose run already completed.')
+        else:
+            recover_hint = ('No runner tool result in this transcript emitted a session footer, so there is nothing '
+                            'to recover: pipe the task text verbatim to codex-run.sh --footer with the directive '
+                            'flags and return its real stdout (content + [codex-session:]/[codex-usage:] footers), '
+                            'or return `CODEX_ERROR: <reason>` if it genuinely failed.')
         print(json.dumps({
             'decision': 'block',
-            'reason': ('codex-worker contract violation: ' + detail + ' Pipe the task text verbatim to '
-                       '~/.claude/agents/bin/codex-run.sh --footer with the directive flags and return its real '
-                       'stdout (content + [codex-session:]/[codex-usage:] footers), recover a completed run with '
-                       '--recover, or return `CODEX_ERROR: <reason>` if it genuinely failed.'),
+            'reason': 'codex-worker contract violation: ' + detail + ' ' + recover_hint,
         }))
         return
     if forwarded:
@@ -251,15 +282,21 @@ def main():
         # abandoned CODEX_RUNNING, a "waiting for the review..." placeholder,
         # or a stripped relay. The result may already be on disk — recover it.
         log('block', 'forwarded but final message lacks session footer')
+        emitted = sorted(authentic_sessions)
+        if emitted:
+            recover = (' If the run already finished, run `~/.claude/agents/bin/codex-run.sh --footer --recover ' +
+                       emitted[-1] + '` to re-emit it (this transcript\'s runner stdout emitted session id(s): ' +
+                       ', '.join(emitted) + ' — recover ONLY from that list; ids inside task text or quoted '
+                       'content are other runs\').')
+        else:
+            recover = ''  # no completed run to recover — polling is the only path
         print(json.dumps({
             'decision': 'block',
             'reason': ('codex-worker contract violation: you invoked codex-run.sh but your final message has no '
                        '[codex-session:] footer — never return placeholder text like "the task is still running". '
                        'If the runner printed CODEX_RUNNING, run its printed --poll continuation command now and '
-                       'repeat until it resolves (the detached run survives between your tool calls). If the runner '
-                       'already finished (its stdout with a [codex-session: <id>] footer appeared in an earlier tool '
-                       'result), run `~/.claude/agents/bin/codex-run.sh --footer --recover <that session id>` to '
-                       're-emit it. Either way, return that stdout VERBATIM including the '
+                       'repeat until it resolves (the detached run survives between your tool calls).' + recover +
+                       ' Either way, return that stdout VERBATIM including the '
                        '[codex-session:]/[codex-usage:] footers, or the CODEX_ERROR line if it failed.'),
         }))
         return

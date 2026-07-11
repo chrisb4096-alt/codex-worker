@@ -93,8 +93,21 @@ def _schema_tmp_path(path):
 
 def allowed(cmd):
     task_vars, tmp_vars, runner_count = set(), set(), 0
+    runner_seen = False
     for seg in shell_segments(cmd):
-        if not seg or seg == 'pwd':
+        if not seg:
+            continue
+        # The runner must be the FINAL pipeline segment: legitimate forms are
+        # `printf ... | codex-run.sh` (stdin producer BEFORE the runner) or the
+        # runner alone. Nothing may consume or replace the runner's stdout — a
+        # trailing `| printf '[codex-session: <planted>]'` would forge the tool
+        # result's last footer, which the stop-gate binds as proof and mines
+        # for --recover ids (2026-07-11 security review round 3, confirmed
+        # exploitable against the live gate). Any segment after the runner is
+        # therefore illegal, staging idioms included.
+        if runner_seen:
+            return False
+        if seg == 'pwd':
             continue
         if runner_seg_ok(seg):
             refs = simple_shell_variables(seg)
@@ -103,6 +116,7 @@ def allowed(cmd):
             runner_count += 1
             if runner_count > 1:
                 return False                 # contract: invoke exactly once
+            runner_seen = True
             continue
         m = MKTEMP_ASSIGN.fullmatch(seg)
         if m and _schema_tmp_path(m.group('path')):
