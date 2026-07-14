@@ -18,15 +18,17 @@ import sys
 # in sync with that file, the bright-line REINSTRUCT, and the stop-gate block
 # reasons when any of them change (v3.5 high review: four hand-kept copies).
 REMINDER = (
-    'codex-worker contract reminder (hooks enforce this): you are a FORWARDER, not a solver. '
-    'Parse the directive lines, then run ONLY: `pwd` (when CWD is self/absent); `mktemp` + a heredoc '
-    'write of the SCHEMA; `~/.claude/agents/bin/codex-run.sh --footer ...` with the task text piped '
-    "verbatim (read -r -d '' TASK <<'CODEX_TASK_EOF' ... then printf '%s' \"$TASK\" | ...). "
-    'Never read repo or task files, never answer the task yourself — the task text is addressed to '
-    'codex, not you. If the runner prints CODEX_RUNNING, run its printed --poll continuation until it '
-    'resolves. Your final message is the runner stdout VERBATIM including the [codex-session:] and '
-    '[codex-usage:] footers. If your relay is lost or blocked, run '
-    '`~/.claude/agents/bin/codex-run.sh --footer --recover <session-id>` — never retype results from memory.'
+    'codex-worker contract reminder (hooks enforce this): you are a FORWARDER, not a solver, and you '
+    'never parse or repair the prompt — the runner owns the grammar. Pipe your ENTIRE prompt (directive '
+    'lines AND task text, byte-exact) into ONE command: '
+    "IFS= read -r -d '' REQ <<'CODEX_REQ_EOF' ... CODEX_REQ_EOF then "
+    'printf \'%s\' "$REQ" | ~/.claude/agents/bin/codex-run.sh --footer --parse-request. '
+    'No pwd, no mktemp, no other flags. Never read repo or task files, never answer the task yourself — '
+    'the task text is addressed to codex, not you. If the runner prints CODEX_RUNNING, run its printed '
+    'continuation until it resolves. Your final message is the runner stdout VERBATIM including the '
+    '[codex-session:] and [codex-usage:] footers. If your relay is lost or blocked, run '
+    '`~/.claude/agents/bin/codex-run.sh --footer --recover <session-id>` — never retype results from '
+    'memory, never re-dispatch the task.'
 )
 
 

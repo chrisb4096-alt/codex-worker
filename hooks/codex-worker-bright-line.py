@@ -5,10 +5,9 @@ Fires on every Bash call (settings matcher: Bash). Acts only when the calling
 agent is a codex-worker forwarder — subagent PreToolUse payloads carry
 `agent_type` (verified live on this Claude Code build, 2026-07-07). The
 command is validated SEGMENT BY SEGMENT (heredoc bodies stripped first — task
-text is data, not commands): every top-level segment must be one of the
-contract's allowed shapes — the path-form codex-run.sh invocation (incl.
---poll continuations), `pwd`, the SCHEMA tmpfile flow (mktemp / heredoc write
-to /tmp or a $VAR path), or the stdin-staging read/printf idioms. A compound
+text is data, not commands): the whole call must be one of exactly three v4
+shapes — the `--parse-request` launch, a runner-authored `--poll`, or a
+`--recover`. Nothing else runs, staging idioms included. A compound
 command that smuggles other work next to a legitimate runner call
 (`cat docs/x; ... codex-run.sh ...`) is denied — whole-string matching was the
 v3.3-review bypass. Denied calls get a re-instruction BEFORE running — the
@@ -17,60 +16,72 @@ Denials are measurable: one line in codex-gate.log plus a violation-averted
 line in ~/.codex-worker/usage.log. Fail-open on errors — never break other
 agents.
 """
-import json, re, sys, time, os
+import json, re, shlex, sys, time, os
 
 sys.path.insert(0, os.path.dirname(__file__))
 from codex_worker_gate_common import (  # noqa: E402
     runner_seg_ok,
     shell_segments,
-    simple_shell_variables,
+    strip_heredocs,
 )
 
 # The runner path (RUNNER_CALL in codex_worker_gate_common.py, applied via
 # runner_seg_ok) must never allow a form the stop-gate refuses to count as proof.
-# The runner path MUST include the `.claude/agents/bin/` prefix: a bare
-# The runner path MUST include the `.claude/agents/bin/` prefix: a bare
-# `/codex-run.sh` tail let a forwarder `cat > /tmp/codex-run.sh` (an allowed
-# heredoc write) then exec `/tmp/codex-run.sh` (both gate-approved) — a
-# write-then-exec bypass (v3.5 high review). A single heredoc segment cannot
-# build the nested `.claude/agents/bin/` dir, so requiring it closes the hole.
-#
-# v3.7 (gb-3, 2026-07-09 audit): the runner path must be the segment's COMMAND
-# WORD, not merely present in it — the old `(?:^|[\s;&|(])...` + `.search()`
-# matched the path as a trailing ARGUMENT, so `echo $(cat FILE) <path>` and
-# `foo $(CMD) <path> --footer` ran the substitution and were ALLOWED.
-# Anchor to `^\s*` and reject any command/process substitution ($( ), backtick,
-# <( >( ) or redirection in the segment — the sole permitted substitution is the
-# benign `$(pwd)` (some forwarders inline `--cwd "$(pwd)"`). Plain $VAR/${VAR}
-# expansion is state-bound below: only HOME and task/schema variables declared
-# in this same Bash call are accepted. runner_seg_ok() pairs the two gates.
-MKTEMP = re.compile(r'^mktemp(?:\s+(?P<path>/tmp/(?!\S*\.\.)[A-Za-z0-9._/-]+))?$')
-MKTEMP_ASSIGN = re.compile(
-    r'^(?P<var>[A-Za-z_]\w*)=\$\(mktemp(?:\s+(?P<path>/tmp/(?!\S*\.\.)[A-Za-z0-9._/-]+))?\)$'
+# It MUST include the `.claude/agents/bin/` prefix under the real $HOME: a bare
+# `/codex-run.sh` tail let a forwarder write and then exec its own runner (the
+# v3.5 write-then-exec bypass), and an unanchored home let a repo-local fake
+# runner pass (mirror-gate review 2026-07-14). runner_seg_ok() also demands the
+# path be the segment's COMMAND WORD and rejects command/process substitution
+# and redirection — as an ARGUMENT it merely rode along while a substitution
+# did the real work.
+# The request variable is pinned to the literal contract name REQ, not any
+# identifier. `read PATH <<'EOF' ... EOF; printf '%s' "$PATH" | runner` would
+# read attacker-controlled heredoc text INTO the exported PATH the runner child
+# inherits — a planted `/tmp/evil:/usr/bin` body then makes the runner exec a
+# forged `codex` (arbitrary code execution with an authentic footer). Only REQ
+# is a safe sink; the contract (codex-worker.md) uses exactly REQ. (security
+# review round 5, 2026-07-14, high.)
+# The IFS= prefix is REQUIRED, not optional: without it `read` strips leading
+# IFS whitespace, so a request opening with a blank-line boundary has that
+# boundary eaten and its first task line PROMOTED into the privileged
+# directive block (SANDBOX:/CWD:/NETWORK: injection — security review round 8,
+# 2026-07-14, high). A stale forwarder using the un-prefixed recipe fails
+# closed into the re-instruction naming the exact new shape.
+REQUEST_ASSIGN = re.compile(
+    r"^IFS=\s+read\s+-r\s+-d\s+''\s+(?P<var>REQ)\s+"
+    r"<<\s*'(?P<delimiter>\w+)'$"
 )
-TASK_READ = re.compile(r"^read\s+-r\s+-d\s+''\s+(?P<var>\w+)\s*(?:<<-?\s*'?\w+'?)?$")
-TASK_PRINTF = re.compile(r'^printf(\s+(--|-[a-zA-Z]+))*\s+\'[^\']*\'(\s+"\$\{?\w+\}?")*$')
-TASK_ECHO = re.compile(r'^echo(\s+(--|-[a-zA-Z]+))*(\s+"\$\{?\w+\}?")+$')
-HEREDOC_WRITE = re.compile(
-    r'^(?:cat|tee)\s*(?:<<-?\s*\'?\w+\'?)?\s*>{1,2}\s*'
-    r'(?:"?\$(?:\{(?P<braced>[A-Za-z_]\w*)\}|(?P<plain>[A-Za-z_]\w*))"?'
-    r'|(?P<path>/tmp/(?!\S*\.\.)[A-Za-z0-9._/-]+))\s*'
-    r'(?:<<-?\s*\'?\w+\'?)?$'
+REQUEST_PRINTF = re.compile(
+    r'''^printf\s+'%s'\s+"\$(?:\{(?P<braced>REQ)\}|(?P<plain>REQ))"$'''
 )
 GATE_LOG = os.path.expanduser('~/.claude/hooks/codex-gate.log')
 USAGE_LOG = os.path.expanduser('~/.codex-worker/usage.log')
 
+# The two runner-authored continuations a forwarder may run after a launch.
+# This PreToolUse hook sees ONE Bash command, never the transcript, so it can
+# only validate these SYNTACTICALLY — the argument's provenance is bound by the
+# other two layers, by design (mirror-gate round 5): the runner's --poll REFUSES
+# a scratch without its own launch-proof stamp (a forged /tmp/codex-worker.* dir
+# fails at the runner, not merely here), and the stop-gate REFUSES to accept a
+# --recover whose session id was not emitted by a launch/poll/recover result in
+# THIS transcript. So a syntactically-valid but injected id can neither poll a
+# foreign run nor have its recovered output accepted as a result.
+POLL_SCRATCH = re.compile(r'^/tmp/codex-worker\.(?!\S*\.\.)[A-Za-z0-9._-]+$')
+RECOVER_ID = re.compile(r'^[0-9a-fA-F-]{8,}$')
+
 REINSTRUCT = (
-    'codex-worker bright line: the only commands you may run are `pwd`, `mktemp` '
-    '(+ a heredoc write of the SCHEMA to that tmp file), and '
-    '~/.claude/agents/bin/codex-run.sh (including its printed --poll continuation) '
-    'fed by the read/printf stdin idiom — with NOTHING else chained alongside. '
-    'Never read files, inspect the repo, or do the task yourself — the task text is '
-    'addressed to codex, not to you. Pipe the task text (everything after the '
-    'directive lines) verbatim to ~/.claude/agents/bin/codex-run.sh --footer with '
-    'flags from the directives, then return its stdout verbatim. If a directive '
-    'value is invalid, return `CODEX_ERROR: invalid directive value <line>` with no '
-    'tool calls.'
+    'codex-worker bright line: pipe the ENTIRE prompt verbatim with the exact '
+    'heredoc-assignment (`IFS= read -r -d \'\' REQ <<\'CODEX_REQ_EOF\'` ... '
+    '`CODEX_REQ_EOF` — the IFS= prefix is required) + `printf \'%s\' "$REQ" | '
+    '~/.claude/agents/bin/codex-run.sh --footer --parse-request` launch shape. '
+    'The runner must be the final pipeline segment and no other flags are allowed. '
+    'After launch, run only the runner-authored --poll continuation, or '
+    '`~/.claude/agents/bin/codex-run.sh --footer --recover <session-id>` when the '
+    'stop hook tells you to recover. Never parse directives, read task files, '
+    'inspect the repo, or solve the task yourself; relay runner stdout verbatim. '
+    'The v3.9 flag-composed launch (--model/--effort/--sandbox/--cwd/--network) '
+    'is REMOVED: if that is the shape your instructions describe, they are stale '
+    '— use the --parse-request shape above.'
 )
 
 
@@ -83,64 +94,85 @@ def log(path, line):
         pass
 
 
-def _schema_tmp_path(path):
-    """Literal tmp paths may hold schema data, never runner scratch controls."""
-    if not path:
-        return True
-    return bool(re.fullmatch(r'(?:schema[A-Za-z0-9._-]*|tmp\.[A-Za-z0-9._-]+)',
-                             os.path.basename(path)))
+def _runner_argv(segment):
+    if not runner_seg_ok(segment):
+        return None
+    try:
+        return shlex.split(segment)
+    except ValueError:
+        return None
+
+
+def _parse_request_shape(cmd):
+    """Accept only the v4 heredoc assignment + final runner pipeline."""
+    normalized = strip_heredocs(cmd or '')
+    lines = normalized.splitlines()
+    if len(lines) != 2:
+        return False
+    assigned = REQUEST_ASSIGN.fullmatch(lines[0].strip())
+    if not assigned:
+        return False
+    # The contract permits exactly CODEX_REQ_EOF and its collision extensions
+    # (CODEX_REQ_EOF_1, ...) — an arbitrary delimiter is an off-contract
+    # forwarder improvisation (re-review 2026-07-14; tightening only).
+    if not re.fullmatch(r'CODEX_REQ_EOF(?:_\d+)?', assigned.group('delimiter')):
+        return False
+    pipeline = lines[1].split('|')
+    if len(pipeline) != 2:
+        return False
+    producer, runner = (part.strip() for part in pipeline)
+    printed = REQUEST_PRINTF.fullmatch(producer)
+    if not printed:
+        return False
+    printed_var = printed.group('braced') or printed.group('plain')
+    argv = _runner_argv(runner)
+    return printed_var == assigned.group('var') and bool(
+        argv and argv[1:] == ['--footer', '--parse-request']
+    )
+
+
+def _continuation_shape(cmd):
+    """Accept only a lone runner-authored --poll or --recover continuation.
+
+    v4.0.2 (mirror-gate review 2026-07-14, high): the v3.9 transition lane is
+    GONE. It let a forwarder heredoc-stage task text of its own authorship and
+    launch it with `--sandbox workspace-write --network on --cwd / --output-file
+    <path>` — prompt-injected text could therefore replace the orchestrator's
+    request, write outside the workspace, and still return an authentic footer
+    that binds as proof. No flag vocabulary can be narrow enough while the
+    forwarder still chooses both the task text and the runner's powers; only
+    `--parse-request` binds the launch to the prompt the forwarder was handed.
+    A stale v3.9-cached forwarder now fails CLOSED and loudly (deny + REINSTRUCT
+    naming the v4 shape) instead of launching an unbound request.
+    """
+    normalized = strip_heredocs(cmd or '')
+    segments = [seg for seg in shell_segments(normalized) if seg]
+    if len(segments) != 1 or not runner_seg_ok(segments[0]):
+        return False
+    argv = _runner_argv(segments[0])
+    if not argv or len(argv) != 4 or argv[1] != '--footer':
+        return False
+    if argv[2] == '--poll':
+        return bool(POLL_SCRATCH.fullmatch(argv[3]))
+    if argv[2] == '--recover':
+        return bool(RECOVER_ID.fullmatch(argv[3]))
+    return False
 
 
 def allowed(cmd):
-    task_vars, tmp_vars, runner_count = set(), set(), 0
-    runner_seen = False
-    for seg in shell_segments(cmd):
-        if not seg:
-            continue
-        # The runner must be the FINAL pipeline segment: legitimate forms are
-        # `printf ... | codex-run.sh` (stdin producer BEFORE the runner) or the
-        # runner alone. Nothing may consume or replace the runner's stdout — a
-        # trailing `| printf '[codex-session: <planted>]'` would forge the tool
-        # result's last footer, which the stop-gate binds as proof and mines
-        # for --recover ids (2026-07-11 security review round 3, confirmed
-        # exploitable against the live gate). Any segment after the runner is
-        # therefore illegal, staging idioms included.
-        if runner_seen:
-            return False
-        if seg == 'pwd':
-            continue
-        if runner_seg_ok(seg):
-            refs = simple_shell_variables(seg)
-            if refs is None or any(v not in ({'HOME'} | tmp_vars) for v in refs):
-                return False
-            runner_count += 1
-            if runner_count > 1:
-                return False                 # contract: invoke exactly once
-            runner_seen = True
-            continue
-        m = MKTEMP_ASSIGN.fullmatch(seg)
-        if m and _schema_tmp_path(m.group('path')):
-            tmp_vars.add(m.group('var'))
-            continue
-        m = MKTEMP.fullmatch(seg)
-        if m and _schema_tmp_path(m.group('path')):
-            continue
-        m = TASK_READ.fullmatch(seg)
-        if m:
-            task_vars.add(m.group('var'))
-            continue
-        if TASK_PRINTF.fullmatch(seg) or TASK_ECHO.fullmatch(seg):
-            refs = simple_shell_variables(seg)
-            if refs is not None and all(v in task_vars for v in refs):
-                continue
-            return False
-        m = HEREDOC_WRITE.fullmatch(seg)
-        if m:
-            target_var = m.group('braced') or m.group('plain')
-            if target_var in tmp_vars or (m.group('path') and _schema_tmp_path(m.group('path'))):
-                continue
-        return False
-    return True
+    # --request-file is DELIBERATELY not accepted here. This hook fires only for
+    # codex-worker forwarders (main(): agent_type == 'codex-worker'); the direct
+    # dispatch lane is the ORCHESTRATOR running the runner from its own Bash,
+    # which this hook never sees. Allowing it would hand a forwarder the one
+    # power v4 exists to remove: it could heredoc-write its own request file
+    # (the legacy /tmp staging shapes still permit that) with directives of its
+    # choosing — SANDBOX: workspace-write, NETWORK: on, CWD: / — or a different
+    # task entirely, then relay a genuine footer that binds as proof for work
+    # the orchestrator never asked for. The forwarder may only forward the
+    # prompt it was given, so --parse-request is its sole launch shape.
+    if _parse_request_shape(cmd):
+        return True
+    return _continuation_shape(cmd)
 
 
 def main():

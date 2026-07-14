@@ -58,16 +58,16 @@ fi
 command -v codex >/dev/null || { echo "ERROR: codex CLI not found — install it and run 'codex login' first" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "ERROR: python3 required for the hooks" >&2; exit 1; }
 
-mkdir -p "$CLAUDE/agents/bin" "$CLAUDE/hooks" "$CLAUDE/workflows" "$HOME/.codex-worker"
-
 # Never write THROUGH a symlink: a link at (or above) a managed path would
 # redirect these copies — and the settings rewrite below — outside ~/.claude.
-# --check already reports such links; the install path must refuse them rather
-# than follow them.
+# This MUST run BEFORE any mkdir: `mkdir -p` follows a pre-existing symlinked
+# parent, so validating after it would already have created dirs outside the
+# tree (mirror-gate 2026-07-14). readlink -f resolves every component; a
+# non-existent path is inert (it can't be a link yet, and mkdir will create it
+# under a base we just checked).
 canon_base="$(readlink -f "$CLAUDE")"
-for p in "$CLAUDE" "$CLAUDE/agents" "$CLAUDE/agents/bin" "$CLAUDE/hooks" "$CLAUDE/workflows" \
-         "$CLAUDE/agents/codex-worker.md" "$CLAUDE/agents/codex-worker-callers.md" \
-         "$CLAUDE/agents/bin/codex-run.sh" "$CLAUDE/settings.json"; do
+refuse_symlink() {
+  local p="$1"
   if [[ -L "$p" ]]; then
     echo "ERROR: $p is a symlink — refusing to install through it. Remove the link and re-run." >&2
     exit 1
@@ -76,7 +76,23 @@ for p in "$CLAUDE" "$CLAUDE/agents" "$CLAUDE/agents/bin" "$CLAUDE/hooks" "$CLAUD
     echo "ERROR: $p resolves outside the managed tree (symlinked parent) — refusing to install." >&2
     exit 1
   fi
+}
+
+# Directory chain (outer first), then EVERY managed leaf, then settings.json and
+# the backup shutil.copy2 writes below. The leaf set is the same managed_pairs
+# --check uses, so hooks/*.py and workflows/*.js are covered, not just the three
+# agent files the old list named.
+for d in "$CLAUDE" "$CLAUDE/agents" "$CLAUDE/agents/bin" "$CLAUDE/hooks" "$CLAUDE/workflows"; do
+  refuse_symlink "$d"
 done
+# ~/.codex-worker is outside $CLAUDE (the canon_base rewrite doesn't apply); a
+# direct link there would redirect the scratch/results tree the runner trusts.
+[[ -L "$HOME/.codex-worker" ]] && { echo "ERROR: $HOME/.codex-worker is a symlink — refusing to install through it." >&2; exit 1; }
+while read -r rel dest; do refuse_symlink "$dest"; done < <(managed_pairs)
+refuse_symlink "$CLAUDE/settings.json"
+refuse_symlink "$CLAUDE/settings.json.codex-worker.bak"
+
+mkdir -p "$CLAUDE/agents/bin" "$CLAUDE/hooks" "$CLAUDE/workflows" "$HOME/.codex-worker"
 
 cp "$REPO/agents/codex-worker.md" "$CLAUDE/agents/"
 cp "$REPO/agents/codex-worker-callers.md" "$CLAUDE/agents/"

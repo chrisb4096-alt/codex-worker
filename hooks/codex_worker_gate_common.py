@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 
 
+# The absolute form must be the INSTALLED runner under this user's real HOME.
+# A suffix match (any path ending in .claude/agents/bin/codex-run.sh) lets a
+# workspace-local fake runner — e.g. <repo>/.claude/agents/bin/codex-run.sh —
+# execute arbitrary code and emit stdout the stop-gate binds as proof
+# (mirror-gate review 2026-07-14, high).
 RUNNER_CALL = re.compile(
-    r"^\s*(?:~|\$HOME|/[^\s`;|&<>()]+?)/\.claude/agents/bin/"
-    r"codex-run\.sh(?:\s|$)"
+    r"^\s*(?:~|\$HOME|" + re.escape(os.path.expanduser("~"))
+    + r")/\.claude/agents/bin/codex-run\.sh(?:\s|$)"
 )
 RUNNER_DANGER = re.compile(r"[`<>]|\$\((?!pwd\))")
 # --verify only prints ok/forged (no [codex-session:] footer, no content) and
@@ -107,6 +113,55 @@ def runner_seg_ok(segment: str, *, proof_only: bool = False) -> bool:
 def runner_invoked(command: str, *, proof_only: bool = False) -> bool:
     return any(runner_seg_ok(segment, proof_only=proof_only)
                for segment in shell_segments(command))
+
+
+def recover_invoked(command: str) -> bool:
+    """True when a runner SEGMENT's argv carries --recover.
+
+    Argv-level on heredoc-stripped segments, never a raw-text search: the
+    prompt body routinely discusses the runner (this repo's own tasks), so a
+    `--recover` inside a heredoc misclassified a genuine launch as a recover
+    and refused to bind its session (mirror-gate round 7, high#2). The runner
+    enters recover mode only on the exact `--recover` argv token (its case
+    branch takes no `=` form), so argv membership is the faithful test.
+    Anything the static split cannot resolve — an unparseable segment, or a
+    `$var` argv token that could expand to --recover at run time — classifies
+    as recover: over-classification only withholds proof binding
+    (fail-closed); under-classification would let a recover's re-emitted
+    foreign footer bind as launch proof."""
+
+    for segment in shell_segments(command):
+        if not RUNNER_CALL.match(segment) or RUNNER_DANGER.search(segment):
+            continue
+        try:
+            argv = shlex.split(segment)
+        except ValueError:
+            return True
+        if any(arg == "--recover" or "$" in arg for arg in argv[1:]):
+            return True
+    return False
+
+
+def poll_scratch(command: str) -> str | None:
+    """Return the runner segment's `--poll <scratch>` argument, or None.
+
+    Argv-level like recover_invoked. The stop-gate uses this to bind a poll's
+    emitted footer to a scratch THIS transcript's own launch printed: without
+    the binding, a leg that never launched could poll another (same-UID)
+    session's registered scratch and relay that run's private result under an
+    authentic footer (security review round 8, 2026-07-14, high)."""
+
+    for segment in shell_segments(command):
+        if not RUNNER_CALL.match(segment) or RUNNER_DANGER.search(segment):
+            continue
+        try:
+            argv = shlex.split(segment)
+        except ValueError:
+            continue
+        for i in range(1, len(argv) - 1):
+            if argv[i] == "--poll":
+                return argv[i + 1]
+    return None
 
 
 def simple_shell_variables(text: str) -> list[str] | None:

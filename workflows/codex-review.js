@@ -17,31 +17,59 @@ const usedTokens = { input: 0, output: 0, reasoning: 0 }
 const codexSessions = []
 const runningLegs = []
 const SESSION_RE = /^\[codex-session: ((?!missing)[0-9a-fA-F-]{8,})\]/m
-const isRunning = (r) => typeof r === 'string' && /^\s*CODEX_RUNNING:/.test(r)
+// The runner APPENDS its footers after the model body, so the genuine session is
+// the LAST match — task output can only plant [codex-session:] lines earlier in
+// the body (mirror-gate round 4). Binding a security decision (archive path,
+// verify_command) to the first match let planted text name a prior session.
+const lastSession = (r) => {
+  if (typeof r !== 'string') return null
+  const m = [...r.matchAll(/^\[codex-session: (?!missing)([0-9a-fA-F-]{8,})\]/gm)]
+  return m.length ? m[m.length - 1][1] : null
+}
+// A genuinely running leg emits ONLY the runner's CODEX_RUNNING line and NO
+// session footer (the runner appends a footer only once the run completes). So a
+// terminal body carrying a session footer is COMPLETE, never running — gating on
+// footer-absence stops attacker model output (which rides a completed run's real
+// footer) from being classified as running (mirror-gate round 5). The surfaced
+// continuation is validated to the runner's exact --poll shape AND its CANONICAL
+// path (~ / $HOME / the resolved home, then /.claude/agents/bin/codex-run.sh) — not
+// any *…/codex-run.sh, which a command-substitution or attacker path in an injected
+// CODEX_RUNNING line would satisfy and then steer the orchestrator's Bash into.
+const RUNNER_HOME = (process.env.HOME || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const RUNNER_PATH = `(?:~|\\$HOME${RUNNER_HOME ? '|' + RUNNER_HOME : ''})/\\.claude/agents/bin/codex-run\\.sh`
+const POLL_CONT = new RegExp(`^\\s*CODEX_RUNNING: re-invoke with: (${RUNNER_PATH} --footer --poll /tmp/codex-worker\\.(?!\\S*\\.\\.)[A-Za-z0-9._-]+)\\s*$`, 'm')
+const isRunning = (r) => typeof r === 'string' && /^\s*CODEX_RUNNING:/.test(r) && !SESSION_RE.test(r)
 const track = (r, label) => {
   const m = typeof r === 'string' && r.match(/^\[codex-usage: input=(\d+) cached=\d+ output=(\d+)(?: reasoning=(\d+))?/m)
   if (m) { usedTokens.input += +m[1]; usedTokens.output += +m[2]; usedTokens.reasoning += +(m[3] || 0) }
-  const s = typeof r === 'string' && r.match(SESSION_RE)
-  if (s) codexSessions.push({ label: label || 'leg', session: s[1] })
-  if (isRunning(r)) runningLegs.push({ label: label || 'leg', continuation: r.trim() })
+  const s = lastSession(r)
+  if (s) codexSessions.push({ label: label || 'leg', session: s })
+  if (isRunning(r)) { const c = r.match(POLL_CONT); runningLegs.push({ label: label || 'leg', continuation: c ? c[1] : null }) }
   return r
 }
 const proofReceipt = () => ({
   workflow_proof: {
-    status: codexSessions.length ? 'UNVERIFIED' : 'NO_SESSIONS',
-    required: codexSessions.length > 0,
+    status: codexSessions.length ? 'VERIFY_REQUIRED' : 'NO_SESSIONS',
+    required: true,
     sessions: codexSessions,
     verify_command: codexSessions.length ? '~/.claude/agents/bin/codex-run.sh --verify ' + codexSessions.map(s => s.session).join(',') : null,
-    instruction: codexSessions.length ? 'Run verify_command and discard the entire Workflow result if any line says forged.' : null,
+    instruction: codexSessions.length ? 'REQUIRED corroboration: run verify_command before consuming results and discard any session marked forged — in the stop-gate one-shot fail-open window a fabricated footer passes parseCodex, and a session id absent from usage.log cannot be real.' : null,
   },
   running_legs: runningLegs,
 })
+// The envelope path is model-relayed TEXT. This workflow sets no OUTPUT_FILE, so
+// the only path the runner can legitimately name is the archive keyed by the
+// GENUINE (last) session — verify it rather than reading whatever the leg says,
+// and never bind to a body-planted first footer (mirror-gate round 4).
+const archiveOf = (session) => `${process.env.HOME}/.codex-worker/results/${session}.txt`
 const parseCodex = (r) => {
   if (!r || typeof r !== 'string') return null
   if (r.trimStart().startsWith('CODEX_ERROR')) return null
-  if (!SESSION_RE.test(r)) return null   // no session = codex never ran
-  const f = r.match(/^\[codex-final-file: (\S+) bytes=(\d+)\]/m)    // >8KB rode the file relay
-  if (f) return { codex_file: f[1], codex_bytes: +f[2] }
+  const s = lastSession(r)
+  if (!s) return null                    // no session = codex never ran
+  const files = [...r.matchAll(/^\[codex-final-file: (\S+) bytes=(\d+)\]/gm)]  // >8KB rode the file relay
+  const f = files.length ? files[files.length - 1] : null
+  if (f) return f[1] === archiveOf(s) ? { codex_file: f[1], codex_bytes: +f[2] } : null
   const cleaned = r.split('\n').filter(l => !/^\[codex-/.test(l)).join('\n')
   for (const [open, close] of [['{', '}'], ['[', ']']]) {
     const a = cleaned.indexOf(open), b = cleaned.lastIndexOf(close)
@@ -72,9 +100,9 @@ const dispatch = async (p, opts) => {
 // Only retry a clean failure, never a run that is still in flight.
 const leg = async (effort, task, opts) => {
   const p = lint(['EFFORT: ' + effort, 'SANDBOX: read-only', 'CWD: ' + args.cwd, '', task].join('\n'))
-  const raw1 = await dispatch(p, { agentType: 'codex-worker', ...opts })
+  const raw1 = await dispatch(p, { ...opts, agentType: 'codex-worker' })
   let v = parseCodex(raw1)
-  if (!v && !isRunning(raw1)) v = parseCodex(await dispatch(p, { agentType: 'codex-worker', ...opts, label: (opts.label || 'leg') + ':retry' }))
+  if (!v && !isRunning(raw1)) v = parseCodex(await dispatch(p, { ...opts, agentType: 'codex-worker', label: (opts.label || 'leg') + ':retry' }))
   return v
 }
 

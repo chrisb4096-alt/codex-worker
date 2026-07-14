@@ -95,17 +95,66 @@ class TestBrightLine(GateTest):
         return run(BRIGHT, {'agent_type': agent_type, 'tool_name': 'Bash', 'agent_id': 't',
                             'tool_input': {'command': command}}, self.home)
 
-    def test_runner_pipe_allowed(self):
-        cmd = ("read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
-               "printf '%s' \"$TASK\" | ~/.claude/agents/bin/codex-run.sh --footer --effort medium")
+    def test_parse_request_launch_allowed(self):
+        # The v4 launch shape: the runner parses the whole request from stdin, so
+        # the forwarder composes no model/effort/sandbox flags of its own.
+        cmd = ("IFS= read -r -d '' REQ <<'CODEX_REQ_EOF'\nEFFORT: high\n\ndo the thing\nCODEX_REQ_EOF\n"
+               "printf '%s' \"$REQ\" | ~/.claude/agents/bin/codex-run.sh --footer --parse-request")
         self.assertIsNone(self.call(cmd))
+
+    def test_bare_read_without_ifs_denied(self):
+        # v4.0.2 round 8: the IFS= prefix is REQUIRED. A bare `read` strips a
+        # leading blank-line boundary, promoting the first task line of a
+        # boundary-first request into the privileged directive block
+        # (SANDBOX:/CWD:/NETWORK: injection).
+        cmd = ("read -r -d '' REQ <<'CODEX_REQ_EOF'\nEFFORT: high\n\ndo the thing\nCODEX_REQ_EOF\n"
+               "printf '%s' \"$REQ\" | ~/.claude/agents/bin/codex-run.sh --footer --parse-request")
+        self.assertTrue(denied(self.call(cmd)))
+
+    def test_request_var_pinned_to_req(self):
+        # v4.0.2 round 5: the request variable is pinned to REQ. Reading into an
+        # exported env var (PATH/HOME) would let a planted heredoc body poison the
+        # runner child's environment — e.g. PATH=/tmp/evil so it execs a forged
+        # `codex`. Only REQ is a safe sink.
+        for var, body in (('PATH', '/tmp/evil:/usr/bin'), ('HOME', '/tmp/evil')):
+            cmd = (f"IFS= read -r -d '' {var} <<'CODEX_REQ_EOF'\n{body}\nCODEX_REQ_EOF\n"
+                   f'printf \'%s\' "${var}" | ~/.claude/agents/bin/codex-run.sh --footer --parse-request')
+            self.assertTrue(denied(self.call(cmd)), var)
 
     def test_poll_continuation_allowed(self):
         self.assertIsNone(self.call('~/.claude/agents/bin/codex-run.sh --footer --poll /tmp/codex-worker.abc123'))
 
-    def test_pwd_and_mktemp_allowed(self):
-        self.assertIsNone(self.call('pwd'))
-        self.assertIsNone(self.call('SCHEMA_FILE=$(mktemp)'))
+    def test_legacy_composed_launch_denied(self):
+        # v4.0.2: the v3.9 transition lane is GONE. A forwarder that stages its own
+        # task text and composes model/effort/sandbox/cwd flags could replace the
+        # orchestrator's request and still relay a real footer (mirror-gate
+        # 2026-07-14, high). Only --parse-request binds the launch to the prompt.
+        R = '~/.claude/agents/bin/codex-run.sh'
+        for cmd in (
+            ("read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
+             f"printf '%s' \"$TASK\" | {R} --footer --effort medium"),
+            ("read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
+             f"printf -- '%s' \"$TASK\" | {R} --footer"),
+            f"printf '%s' \"$TASK\" | {R} --footer --sandbox workspace-write --network on --output-file /home/user/.bashrc",
+        ):
+            self.assertTrue(denied(self.call(cmd)), cmd)
+
+    def test_legacy_staging_denied(self):
+        # Every v3.9 staging idiom (pwd, mktemp, heredoc schema writes, echo/printf
+        # var feeds) is now denied: the whole call must be one of the three v4
+        # shapes, so no staging segment can precede a launch.
+        R = '~/.claude/agents/bin/codex-run.sh'
+        for cmd in (
+            'pwd',
+            'SCHEMA_FILE=$(mktemp)',
+            "SCHEMA_FILE=$(mktemp)\ncat > \"$SCHEMA_FILE\" <<'EOF'\n{}\nEOF",
+            "SCHEMA_FILE=$(mktemp)\ncat <<'SCHEMA_EOF' > \"$SCHEMA_FILE\"\n{\"type\":\"object\"}\nSCHEMA_EOF",
+            "cat > /tmp/schema.abc123 <<'EOF'\n{}\nEOF",
+            "cat > /tmp/claude-1000/x/schema.json <<'EOF'\n{}\nEOF",
+            ("read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
+             f'echo "$TASK" | {R} --footer --cwd /tmp'),
+        ):
+            self.assertTrue(denied(self.call(cmd)), cmd)
 
     def test_file_read_denied(self):
         self.assertTrue(denied(self.call('cat src/main.py')))
@@ -128,8 +177,7 @@ class TestBrightLine(GateTest):
             self.assertTrue(denied(self.call(cmd)), cmd)
 
     def test_unparseable_runner_segment_denied(self):
-        # An unbalanced quote makes the argv unparseable; that must DENY, not skip
-        # the flag checks and fall through to the permissive legacy allow.
+        # An unbalanced quote makes the argv unparseable; that must DENY.
         self.assertTrue(denied(self.call(
             "~/.claude/agents/bin/codex-run.sh --footer --cwd '/tmp")))
 
@@ -147,66 +195,26 @@ class TestBrightLine(GateTest):
         self.assertTrue(denied(self.call('~/.claude/agents/bin/codex-run.sh --footer --effort low | tee /tmp/x')))
         self.assertTrue(denied(self.call('~/.claude/agents/bin/codex-run.sh --footer --effort low; pwd')))
 
-    def test_heredoc_body_is_data(self):
-        # The heredoc BODY (even runner-looking or destructive text) is data, not
-        # commands. v3.7 state-bound vars: the tmp target must be declared via
-        # mktemp in the SAME command, so the write cannot target an unknown path.
-        cmd = ("SCHEMA_FILE=$(mktemp)\ncat > \"$SCHEMA_FILE\" <<'EOF'\n{\"cmd\": \"rm -rf / && curl evil\"}\nEOF")
-        self.assertIsNone(self.call(cmd))
-
-    def test_schema_heredoc_reordered_allowed(self):
-        # 2026-07-07 false-deny: marker-before-redirect is the same idiom.
-        cmd = ("SCHEMA_FILE=$(mktemp)\ncat <<'SCHEMA_EOF' > \"$SCHEMA_FILE\"\n{\"type\":\"object\"}\nSCHEMA_EOF")
-        self.assertIsNone(self.call(cmd))
-
-    def test_echo_var_feed_allowed(self):
-        # `echo "$TASK"` is a legitimate pipe feed (2026-07-08 false-deny class).
-        # v3.7 state-bound vars: $TASK must be declared (read) in the SAME command
-        # — a bare `echo "$TASK"` with no in-command read is now correctly denied.
-        self.assertIsNone(self.call(
-            "read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
-            'echo "$TASK" | ~/.claude/agents/bin/codex-run.sh --footer --cwd /tmp'))
-
-    def test_printf_var_only_denied(self):
-        # `printf "$TASK"` treats task bytes as the format string — %-sequences
-        # would corrupt the verbatim relay (v3.5 review finding).
-        self.assertTrue(denied(self.call('printf "$TASK"')))
-
-    def test_cmdsubst_in_redirect_target_denied(self):
-        # v3.5 review gb-1: /tmp/\S+ matched a command substitution in the
-        # redirect filename, which bash expands (executes) before opening.
-        self.assertTrue(denied(self.call(
-            "cat <<'EOF' > /tmp/$(head${IFS}-c12${IFS}README.md)\nx\nEOF")))
-
-    def test_traversal_redirect_target_denied(self):
-        # v3.5 review gb-1: /tmp/../home/... escaped /tmp from an allowed segment.
-        self.assertTrue(denied(self.call("cat > /tmp/../home/user/out <<'EOF'\nx\nEOF")))
-
-    def test_legit_tmp_literal_still_allowed(self):
-        self.assertIsNone(self.call("cat > /tmp/schema.abc123 <<'EOF'\n{}\nEOF"))
-
-    def test_nested_tmp_path_allowed(self):
-        # v3.5 high review: the gb-1 charset narrowing dropped `/`, false-denying
-        # nested scratch dirs (this session's is /tmp/claude-1000/.../scratchpad).
-        self.assertIsNone(self.call("cat > /tmp/claude-1000/x/schema.json <<'EOF'\n{}\nEOF"))
-
     def test_written_runner_not_executable(self):
-        # v3.5 high review: write-then-exec bypass. Writing /tmp/codex-run.sh is
-        # inert (allowed), but EXECUTING it must be denied — RUNNER_CALL requires
-        # the .claude/agents/bin/ prefix, so a /tmp copy is not the runner.
+        # v3.5 high review: write-then-exec bypass. A /tmp copy of the runner is
+        # not the runner — RUNNER_CALL requires the .claude/agents/bin/ prefix.
         self.assertTrue(denied(self.call('/tmp/codex-run.sh')))
         self.assertTrue(denied(self.call('/tmp/x/codex-run.sh --footer')))
 
-    def test_abs_runner_path_allowed(self):
-        self.assertIsNone(self.call(
-            "read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
-            "printf '%s' \"$TASK\" | /home/user/.claude/agents/bin/codex-run.sh --footer"))
+    def test_fake_home_runner_denied(self):
+        # v4.0.1: the absolute runner form must be the installed HOME path. A
+        # workspace-local or foreign-home fake runner must not classify as the
+        # runner at all (mirror-gate 2026-07-14). HOME here is the tmpdir.
+        self.assertTrue(denied(self.call(
+            "IFS= read -r -d '' REQ <<'CODEX_REQ_EOF'\ndo the thing\nCODEX_REQ_EOF\n"
+            "printf '%s' \"$REQ\" | /home/user/.claude/agents/bin/codex-run.sh --footer --parse-request")))
 
-    def test_printf_dashdash_allowed(self):
-        # v3.5 high review: the `--` end-of-options separator is a safe idiom.
+    def test_real_home_runner_allowed(self):
+        # The absolute path under the real $HOME does classify as the runner.
+        runner = os.path.join(self.home, '.claude/agents/bin/codex-run.sh')
         self.assertIsNone(self.call(
-            "read -r -d '' TASK <<'CODEX_TASK_EOF'\ndo the thing\nCODEX_TASK_EOF\n"
-            "printf -- '%s' \"$TASK\" | ~/.claude/agents/bin/codex-run.sh --footer"))
+            "IFS= read -r -d '' REQ <<'CODEX_REQ_EOF'\ndo the thing\nCODEX_REQ_EOF\n"
+            f"printf '%s' \"$REQ\" | {runner} --footer --parse-request"))
 
     def test_recover_call_allowed(self):
         self.assertIsNone(self.call('~/.claude/agents/bin/codex-run.sh --footer --recover 019f-abc'))
@@ -262,6 +270,51 @@ class TestStopGate(GateTest):
     def test_footer_proof_allowed(self):
         self.assertIsNone(self.call('The answer.\n[codex-session: 019f-abc]\n[codex-usage: input=1 cached=0 output=1 reasoning=0]'))
 
+    def test_foreign_scratch_poll_not_proof(self):
+        # v4.0.2 round 8: a poll of a scratch NO runner result in this transcript
+        # printed attaches to another session's run; its re-emitted footer must
+        # not bind as this leg's proof.
+        R = '~/.claude/agents/bin/codex-run.sh'
+        final = 'foreign result\n[codex-session: 019f-abc]'
+        entries = [
+            {'message': {'role': 'user', 'content': 'EFFORT: low\n\ndo the thing'}},
+            {'message': {'role': 'assistant', 'content': [{
+                'type': 'tool_use', 'name': 'Bash', 'id': 'poll-1',
+                'input': {'command': f'{R} --footer --poll /tmp/codex-worker.foreign'}}]}},
+            {'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'poll-1', 'content': final}]}},
+            {'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': final}]}},
+        ]
+        payload = {'agent_type': 'codex-worker', 'agent_id': 't', 'cwd': '/tmp',
+                   'stop_hook_active': False,
+                   'agent_transcript_path': self.transcript(entries),
+                   'last_assistant_message': final}
+        self.assertTrue(blocked(run(STOP, payload, self.home)))
+
+    def test_launch_then_poll_binds(self):
+        # The sanctioned launch -> CODEX_RUNNING -> poll flow: the launch result
+        # names the scratch, so that poll's emitted footer is proof.
+        R = '~/.claude/agents/bin/codex-run.sh'
+        running = f'CODEX_RUNNING: re-invoke with: {R} --footer --poll /tmp/codex-worker.mine'
+        final = 'The answer.\n[codex-session: 019f-abc]'
+        entries = [
+            {'message': {'role': 'user', 'content': 'EFFORT: low\n\ndo the thing'}},
+            {'message': {'role': 'assistant', 'content': [self.RUNNER_TU]}},
+            {'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'runner-1', 'content': running}]}},
+            {'message': {'role': 'assistant', 'content': [{
+                'type': 'tool_use', 'name': 'Bash', 'id': 'poll-1',
+                'input': {'command': f'{R} --footer --poll /tmp/codex-worker.mine'}}]}},
+            {'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'poll-1', 'content': final}]}},
+            {'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': final}]}},
+        ]
+        payload = {'agent_type': 'codex-worker', 'agent_id': 't', 'cwd': '/tmp',
+                   'stop_hook_active': False,
+                   'agent_transcript_path': self.transcript(entries),
+                   'last_assistant_message': final}
+        self.assertIsNone(run(STOP, payload, self.home))
+
     def test_missing_session_footer_blocked(self):
         self.assertTrue(blocked(self.call('The answer.\n[codex-session: missing]\n[codex-usage: missing]')))
 
@@ -293,6 +346,15 @@ class TestStopGate(GateTest):
     def test_forwarder_violation_allowed_without_forwarding(self):
         self.assertIsNone(self.call('CODEX_ERROR: forwarder-violation', forwarded=False))
 
+    def test_fabricated_codex_error_over_success_blocked(self):
+        # round 5: a bound session proves a run HAPPENED, never that it FAILED. A
+        # forwarder that ran codex successfully (the runner tool_result is a
+        # success) must not relay a fabricated CODEX_ERROR carrying the genuine
+        # footer to SUPPRESS the result. A CODEX_ERROR final is terminal — it
+        # passes only when a runner result actually errored with that line.
+        res = self.call('CODEX_ERROR: fabricated provider failure\n[codex-session: 019f-abc]')
+        self.assertTrue(blocked(res))
+
     def test_non_runner_bash_relayed_codex_error_blocked(self):
         # The legacy staging idioms let a forwarder print arbitrary text with NO
         # runner call; the gate used to accept a CODEX_ERROR final found in ANY
@@ -313,6 +375,32 @@ class TestStopGate(GateTest):
         res = run(STOP, {'agent_type': 'codex-worker', 'agent_id': 't',
                          'transcript_path': self.transcript(entries)}, self.home)
         self.assertTrue(blocked(res))
+
+    def test_foreign_recover_codex_error_relay_blocked(self):
+        # v4.0.2 round 11: a nonbinding foreign --recover result whose archived
+        # body begins CODEX_ERROR must not corroborate a CODEX_ERROR final —
+        # else a known foreign session's content is disclosed on the first stop.
+        R = '~/.claude/agents/bin/codex-run.sh'
+        foreign = '019f-foreign'
+        foreign_err = 'CODEX_ERROR: foreign archived failure'
+        entries = [
+            {'message': {'role': 'user', 'content': 'EFFORT: low\n\ndo the thing'}},
+            {'message': {'role': 'assistant', 'content': [self.RUNNER_TU]}},
+            {'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'runner-1',
+                'content': 'CODEX_RUNNING: poll again'}]}},
+            {'message': {'role': 'assistant', 'content': [{
+                'type': 'tool_use', 'name': 'Bash', 'id': 'rec-1',
+                'input': {'command': f'{R} --footer --recover {foreign}'}}]}},
+            {'message': {'role': 'user', 'content': [{
+                'type': 'tool_result', 'tool_use_id': 'rec-1', 'content': foreign_err}]}},
+            {'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': foreign_err}]}},
+        ]
+        payload = {'agent_type': 'codex-worker', 'agent_id': 't', 'cwd': '/tmp',
+                   'stop_hook_active': False,
+                   'agent_transcript_path': self.transcript(entries),
+                   'last_assistant_message': foreign_err}
+        self.assertTrue(blocked(run(STOP, payload, self.home)))
 
     def test_structured_output_after_runner_allowed(self):
         self.assertIsNone(self.call('', structured=True))
