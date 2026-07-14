@@ -11,6 +11,7 @@ CLAUDE="$HOME/.claude"
 managed_pairs() {
   # repo-relative path -> installed absolute path, one pair per line
   echo "agents/codex-worker.md $CLAUDE/agents/codex-worker.md"
+  echo "agents/codex-worker-callers.md $CLAUDE/agents/codex-worker-callers.md"
   echo "agents/bin/codex-run.sh $CLAUDE/agents/bin/codex-run.sh"
   local f
   for f in "$REPO"/hooks/*.py; do
@@ -58,7 +59,27 @@ command -v codex >/dev/null || { echo "ERROR: codex CLI not found — install it
 command -v python3 >/dev/null || { echo "ERROR: python3 required for the hooks" >&2; exit 1; }
 
 mkdir -p "$CLAUDE/agents/bin" "$CLAUDE/hooks" "$CLAUDE/workflows" "$HOME/.codex-worker"
+
+# Never write THROUGH a symlink: a link at (or above) a managed path would
+# redirect these copies — and the settings rewrite below — outside ~/.claude.
+# --check already reports such links; the install path must refuse them rather
+# than follow them.
+canon_base="$(readlink -f "$CLAUDE")"
+for p in "$CLAUDE" "$CLAUDE/agents" "$CLAUDE/agents/bin" "$CLAUDE/hooks" "$CLAUDE/workflows" \
+         "$CLAUDE/agents/codex-worker.md" "$CLAUDE/agents/codex-worker-callers.md" \
+         "$CLAUDE/agents/bin/codex-run.sh" "$CLAUDE/settings.json"; do
+  if [[ -L "$p" ]]; then
+    echo "ERROR: $p is a symlink — refusing to install through it. Remove the link and re-run." >&2
+    exit 1
+  fi
+  if [[ -e "$p" && "$(readlink -f "$p")" != "${p/#$CLAUDE/$canon_base}" ]]; then
+    echo "ERROR: $p resolves outside the managed tree (symlinked parent) — refusing to install." >&2
+    exit 1
+  fi
+done
+
 cp "$REPO/agents/codex-worker.md" "$CLAUDE/agents/"
+cp "$REPO/agents/codex-worker-callers.md" "$CLAUDE/agents/"
 cp "$REPO/agents/bin/codex-run.sh" "$CLAUDE/agents/bin/" && chmod +x "$CLAUDE/agents/bin/codex-run.sh"
 cp "$REPO"/hooks/*.py "$CLAUDE/hooks/" && chmod +x "$CLAUDE"/hooks/codex-worker-*.py "$CLAUDE/hooks/workflow-args-gate.py"
 cp "$REPO"/workflows/*.js "$CLAUDE/workflows/"
@@ -75,13 +96,26 @@ if os.path.exists(path):
 def hook(cmd, timeout):
     return {'type': 'command', 'command': cmd, 'timeout': timeout}
 
+# v4: the SubagentStop stop-gate rides the AGENT FRONTMATTER in
+# agents/codex-worker.md (fires on both the Agent and Workflow lanes), so it
+# is no longer merged into settings.json — and an entry a pre-v4 install
+# merged must be RETIRED or the gate double-fires on every stop.
 WANTED = [
     ('PreToolUse', 'Workflow', hook('python3 ~/.claude/hooks/workflow-args-gate.py', 10)),
     ('PreToolUse', 'Bash', hook('python3 ~/.claude/hooks/codex-worker-bright-line.py', 5)),
-    ('SubagentStop', None, hook('python3 ~/.claude/hooks/codex-worker-stop-gate.py', 15)),
     ('SubagentStart', 'codex-worker', hook('python3 ~/.claude/hooks/codex-worker-start-context.py', 5)),
 ]
 hooks = settings.setdefault('hooks', {})
+RETIRE = 'codex-worker-stop-gate.py'
+kept_groups = []
+for e in hooks.get('SubagentStop', []):
+    kept = [x for x in e.get('hooks', []) if RETIRE not in x.get('command', '')]
+    if kept:
+        kept_groups.append({**e, 'hooks': kept})
+if kept_groups:
+    hooks['SubagentStop'] = kept_groups
+else:
+    hooks.pop('SubagentStop', None)
 for event, matcher, h in WANTED:
     entries = hooks.setdefault(event, [])
     target = None

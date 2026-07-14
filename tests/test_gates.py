@@ -110,6 +110,29 @@ class TestBrightLine(GateTest):
     def test_file_read_denied(self):
         self.assertTrue(denied(self.call('cat src/main.py')))
 
+    def test_lifecycle_flags_denied(self):
+        # v4 put lifecycle/introspection ops on the same binary the forwarder may
+        # call. A forwarder gets launch/poll/recover and nothing else: --record-codex
+        # would pin a foreign live pid into another attempt's manifest (it would then
+        # poll running forever and never orphan), and --cancel/--finalize would kill
+        # or terminalize a run belonging to someone else. These are the orchestrator's
+        # own lane, which this gate never sees.
+        R = '~/.claude/agents/bin/codex-run.sh'
+        for cmd in (f'{R} --footer --cancel codex-worker.abc123',
+                    f'{R} --footer --finalize /tmp/codex-worker.abc123',
+                    f'{R} --record-codex /tmp/codex-worker.abc123 1234',
+                    f'{R} --sweep',
+                    f'{R} --footer --status codex-worker.abc123',
+                    f'{R} --doctor',
+                    f'{R} --footer --verify 019f0000-aaaa-7000-8000-000000000000'):
+            self.assertTrue(denied(self.call(cmd)), cmd)
+
+    def test_unparseable_runner_segment_denied(self):
+        # An unbalanced quote makes the argv unparseable; that must DENY, not skip
+        # the flag checks and fall through to the permissive legacy allow.
+        self.assertTrue(denied(self.call(
+            "~/.claude/agents/bin/codex-run.sh --footer --cwd '/tmp")))
+
     def test_compound_smuggle_denied(self):
         self.assertTrue(denied(self.call('cat docs/x.md; printf hi | ~/.claude/agents/bin/codex-run.sh --footer')))
 
@@ -259,8 +282,37 @@ class TestStopGate(GateTest):
         self.assertTrue(blocked(res))
         self.assertIn('forwarding', res['reason'])
 
-    def test_codex_error_allowed_without_forwarding(self):
-        self.assertIsNone(self.call('CODEX_ERROR: unknown directive EFORT: low', forwarded=False))
+    def test_self_authored_codex_error_blocked(self):
+        # v4: the RUNNER owns the request grammar, so the forwarder never parses
+        # directives and has no reason to author a directive error — a general
+        # self-authored CODEX_ERROR is a fabricated failure and must block. Only
+        # the exact `CODEX_ERROR: forwarder-violation` spelling is self-authorable.
+        self.assertTrue(blocked(
+            self.call('CODEX_ERROR: unknown directive EFORT: low', forwarded=False)))
+
+    def test_forwarder_violation_allowed_without_forwarding(self):
+        self.assertIsNone(self.call('CODEX_ERROR: forwarder-violation', forwarded=False))
+
+    def test_non_runner_bash_relayed_codex_error_blocked(self):
+        # The legacy staging idioms let a forwarder print arbitrary text with NO
+        # runner call; the gate used to accept a CODEX_ERROR final found in ANY
+        # Bash result, laundering a fabricated failure. It must come from a RUNNER
+        # result (2026-07-14 security review).
+        fake = 'CODEX_ERROR: fabricated provider failure'
+        staged = ("read -r -d '' TASK <<'CODEX_TASK_EOF'\n" + fake +
+                  "\nCODEX_TASK_EOF\nprintf '%s' \"$TASK\"")
+        entries = [
+            {'message': {'role': 'user', 'content': 'EFFORT: low\n\ndo the thing'}},
+            {'message': {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'name': 'Bash', 'id': 'staged-1',
+                 'input': {'command': staged}}]}},
+            {'message': {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 'staged-1', 'content': fake}]}},
+            {'message': {'role': 'assistant', 'content': [{'type': 'text', 'text': fake}]}},
+        ]
+        res = run(STOP, {'agent_type': 'codex-worker', 'agent_id': 't',
+                         'transcript_path': self.transcript(entries)}, self.home)
+        self.assertTrue(blocked(res))
 
     def test_structured_output_after_runner_allowed(self):
         self.assertIsNone(self.call('', structured=True))
