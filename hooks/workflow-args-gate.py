@@ -10,11 +10,14 @@ Two deterministic checks, both upstream of every runtime guard:
    DIRECTLY to an object/array is NOT denied: some harness builds serialize
    correctly-passed object args before the hook sees them (2026-07-08 false-
    positive incident bricked every Workflow dispatch), so that shape is
-   indistinguishable from a correct call here — the script-side parse-or-throw
-   guard (check 2) is the enforcement point that repairs or rejects it.
-2. Unguarded args use — a script that reads args.* / args[...] without the
-   typeof-args parse-or-throw guard would corrupt silently if a string ever
-   slipped through; require the guard so scripts fail loudly on their own.
+   indistinguishable from a correct call here — the script-side parse-if-string
+   guard (check 2) is the enforcement point that repairs it.
+2. Unguarded args use — a script that reads args.* / args[...] must carry the
+   parse-IF-STRING repair (typeof check + JSON.parse(args)). A throw-only
+   guard is NOT enough: harness-serialized object args are a healthy shape,
+   so throwing on string wastes the whole launch on a correct call (live-hit
+   2026-07-13: a run died at 4ms on its own parse-or-throw guard and needed
+   a manual script edit + resume).
 
 Deny returns the reason to the model, which re-issues the call correctly.
 Fail-open on anything unreadable — this gate must never block valid work.
@@ -28,6 +31,9 @@ LOG = os.path.expanduser('~/.claude/hooks/workflow-gate.log')
 # const {cwd} = args). Destructuring was a live miss (2026-07-08 review).
 ARGS_USE = re.compile(r'\bargs\s*[.\[?]|=\s*args\b')
 GUARD = 'typeof args'
+# The repair half: a string args must be PARSED back to an object, not merely
+# detected-and-thrown (throwing rejects healthy harness-serialized calls).
+REPAIR = re.compile(r'JSON\s*\.\s*parse\s*\(\s*(?:String\s*\(\s*)?args')
 
 
 def log(verdict, why):
@@ -103,14 +109,18 @@ def main():
                 why = 'args string parses to object — runtime guard governs'
 
     script = script_text(ti)
-    if script and ARGS_USE.search(script) and GUARD not in script:
-        deny('Workflow script reads args.* without the parse-or-throw guard. '
-             "Open the script body with:\n"
+    if script and ARGS_USE.search(script) and (GUARD not in script or not REPAIR.search(script)):
+        why = ('unguarded args use in script' if GUARD not in script
+               else 'throw-only args guard (no JSON.parse repair)')
+        deny('Workflow script reads args.* without the parse-IF-STRING repair. '
+             'The harness may serialize object args before the script sees them, '
+             'so a throw-on-string guard rejects healthy calls — the script must '
+             'PARSE instead. Open the script body with:\n'
              "if (typeof args === 'string') { try { args = JSON.parse(args) } catch {} }\n"
              "if (!args?.<required-key>) throw new Error('args.<required-key> required — "
              "pass args as a real object')\n"
              'then re-issue the call.',
-             'unguarded args use in script')
+             why)
 
     log('allow', why)
 

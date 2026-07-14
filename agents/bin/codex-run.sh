@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# codex-run.sh — deterministic runner for the codex-worker contract (v3.7).
+# codex-run.sh — deterministic runner for the codex-worker contract (v3.8).
+# v3.8 (2026-07-13): REVIEW uncommitted + task text auto-converts to custom
+# (same uncommitted diff, caller's instructions as the review prompt) instead
+# of failing the leg; base=/commit= with task text still hard-error (codex
+# 0.144.0 cannot combine a custom prompt with --base/--commit).
 # v3.6 (2026-07-09): default model gpt-5.5 -> gpt-5.6-sol; default effort
 # medium -> high; effort enum extended to none|low|medium|high|xhigh|max|ultra
 # (verified on codex 0.144.0; codex maps `ultra` -> `max` API effort + proactive
@@ -356,8 +360,18 @@ else
   cat > "$S/task.txt"
   if [ -n "$REVIEW" ] && [ "$REVIEW" != custom ]; then
     # Targeted reviews use codex's canned prompt; codex 0.144.0 cannot combine a
-    # custom prompt with --uncommitted/--base/--commit.
-    [ -s "$S/task.txt" ] && { echo "CODEX_ERROR: REVIEW '$REVIEW' cannot take task text on codex 0.144.0 — use 'REVIEW: custom' (your instructions, reviews uncommitted changes) or drop the task text" >&2; rm -rf "$S"; exit 2; }
+    # custom prompt with --uncommitted/--base/--commit. 'custom' reviews the
+    # same uncommitted diff with the caller's instructions, so uncommitted +
+    # task text converts losslessly instead of failing the leg (live-hit
+    # 2026-07-13: a Workflow verify leg died on this).
+    if [ -s "$S/task.txt" ]; then
+      if [ "$REVIEW" = uncommitted ]; then
+        echo "codex-run: REVIEW uncommitted + task text — auto-converted to REVIEW custom" >&2
+        REVIEW=custom
+      else
+        echo "CODEX_ERROR: REVIEW '$REVIEW' cannot take task text on codex 0.144.0 — base=/commit= reviews use codex's canned prompt; drop the task text (only 'uncommitted' auto-converts to custom)" >&2; rm -rf "$S"; exit 2
+      fi
+    fi
   else
     [ -s "$S/task.txt" ] || { echo "CODEX_ERROR: empty task on stdin" >&2; rm -rf "$S"; exit 2; }
   fi
