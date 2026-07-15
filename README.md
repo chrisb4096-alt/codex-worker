@@ -4,7 +4,21 @@ Run Claude Code's multi-agent workflows on OpenAI Codex (GPT-5.6-sol) workers. C
 
 The result, measured on real workloads: a comparable multi-agent code review costs roughly **$1.28 of Claude-side API-equivalent tokens instead of $117** (details and caveats in [Token economics](#token-economics)).
 
-## What this is
+## Start here: direct dispatch (the default)
+
+There are two ways to run Claude-orchestrates-Codex, and for most people — anyone on a personal machine, which usually means a Mac — the right one is the simple one:
+
+**[`codex-mac.md`](codex-mac.md)** — the Claude Code main loop dispatches `codex exec` directly from Bash. **No install step, no hooks, no runner** — if you have Claude Code and the Codex CLI logged in on the same machine, you're done:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/chrisb4096-alt/codex-worker/main/codex-mac.md -o ~/codex-mac.md
+```
+
+then add the pointer line it suggests to your `~/.claude/CLAUDE.md` so every session reads it before dispatching Codex work. The document carries everything that actually matters: the canonical `codex exec` shapes, an evidence-derived model/effort routing table (which model for which role, and why), fan-out rules, and the verification discipline that keeps a reward-hacking-prone worker honest.
+
+Everything below this section is the **alternative** mode: the runner/forwarder/gate machinery, built for a different trust boundary — a shared Linux fleet where legs execute inside a thin, untrusted small-model forwarder that must be mechanically policed, so orchestrator tokens are spent on a haiku-class relay instead of the main loop. If that's not your situation, you don't need it; the doctrine section of `codex-mac.md` explains exactly when you would.
+
+## The runner model (the fleet alternative)
 
 Claude Code's `Agent` tool and `Workflow` tool can spawn subagents of a custom type. This repo defines one: `codex-worker`, a deliberately thin forwarder whose only job is to pipe a task to the Codex CLI and relay the answer back verbatim. Around it sit a runner script, four enforcement hooks, and three ready-made workflow templates.
 
@@ -65,7 +79,9 @@ The full contract, including the caller-side parsing snippet and a routing rubri
 
 Callers treat worker output as evidence, not authority. The canonical `parseCodex` helper (used by all three bundled workflows) rejects anything without a valid session footer, unwraps file-relay envelopes, and brace-extracts JSON so a stray fence doesn't kill a leg. Failed legs retry once, then surface as failures — never as silently missing data.
 
-## Install
+## Install (runner model only)
+
+Direct dispatch (the default, above) has **no install step** — this section is for the runner/forwarder model.
 
 ```bash
 git clone https://github.com/chrisb4096-alt/codex-worker
