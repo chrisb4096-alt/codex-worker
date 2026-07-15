@@ -100,6 +100,14 @@ codex exec resume <session-id> -m … -c model_reasoning_effort=… --json 2>&1 
   file itself under workspace-write and make the final message the summary
   (no `-o`). `--output-schema <FILE>` forces the final JSON shape when you
   post-process mechanically.
+- **`--json` carries the full deliverable twice on stdout** (`agent_message`
+  events + `item.completed`), so long legs can overflow an orchestrator's
+  inline tool-result limit (measured: a research leg's stream blew a 64KB
+  cap). When only the `-o` deliverable is needed, capture the stream to a side
+  file — `> /abs/scratch/leg-stream.jsonl 2>&1` — and read the `-o` file; keep
+  the stream file for forensics. `codex exec` also has **no built-in timing**:
+  wrap the dispatch in `date` stamps when wall-clock matters as routing
+  evidence.
 - Chain legs on **distilled outputs only** (paths, summaries, structured
   results) — never by replaying a prior leg's transcript into the next prompt.
 - Direct dispatch does not broaden sandbox/CWD/network authority: pin the
@@ -246,6 +254,19 @@ write-ups), reconciled with lessons from real multi-leg runs:
 - **Design handoff:** Fable defines the system/tokens → Sol drafts screens
   against it → Fable does the final fidelity + taste pass. Never ask Sol to
   match an existing look from a screenshot alone.
+- **Research legs: pin the source bar.** Unconstrained, Sol cites summary
+  aggregators (YouTube-recap mills) alongside primary sources. Add *"prefer
+  primary sources over summary aggregators; cite first-party URLs"* to
+  research task text, and treat leg citations as leg-asserted until
+  independently verified.
+- **Legs are not hermetic to their task text.** codex discovers user-scope
+  config from inside a leg — a research leg was observed spontaneously reading
+  a local skill under `~/.codex/skills/` and using it as domain grounding.
+  Usually benign-to-useful, but never assume a leg saw only its prompt; keep
+  secrets out of user-scope skill/config dirs, and account for skill-content
+  bleed when interpreting a leg's framing. (Minor stream noise: `web_search`
+  `item.started` events emit empty query strings that `item.completed` later
+  fills — harmless unless parsing progress live.)
 
 ## 6. Effort default & `ultra`
 
