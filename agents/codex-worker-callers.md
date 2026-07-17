@@ -80,6 +80,16 @@ forwarder.
 - CWD MUST EXIST for `workspace-write`; typos must fail. `CREATE_CWD: on`
   authorizes runner `mkdir -p` only for intentional research/image scratch.
 - Read-only/review CWDs must exist; `CREATE_CWD` does not change their behavior.
+- SANDBOX MATCHES THE DELIVERABLE, NOT THE TASK: `SANDBOX: read-only` is valid
+  only when the entire deliverable returns as final-message text (exported via
+  `OUTPUT_FILE` if needed). Task text that instructs the leg to WRITE a file —
+  design draft, review report, patch — requires `SANDBOX: workspace-write` with
+  `CWD:` the directory receiving the file (a scratch cwd keeps real repos
+  protected). Getting this wrong completes all the work then fails at the final
+  write, with the deliverable trapped in the dead session (2026-07-16 V2DE
+  design leg); rescue via `RESUME` with the session id and
+  `SANDBOX: workspace-write`, never a re-run (raw CLI note: `codex exec resume`
+  rejects `--sandbox`; sandbox rides `-c 'sandbox_mode="workspace-write"'`).
 - OUTPUT_FILE IS RUNNER-OWNED FINAL-TEXT EXPORT. Never point it at a task path
   Codex creates/modifies; never use it for an image, report, patch, or source.
 - For research/artifact legs, have Codex write the named artifact and return a
